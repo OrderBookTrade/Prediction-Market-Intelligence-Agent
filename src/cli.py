@@ -16,6 +16,11 @@ console = Console()
 logger = logging.getLogger(__name__)
 
 
+@app.callback()
+def _root() -> None:
+    """Prediction Market Intelligence Agent."""
+
+
 @app.command()
 def ingest(
     category: Optional[str] = typer.Option(None, "--category", "-c", help="Gamma tag_slug filter"),
