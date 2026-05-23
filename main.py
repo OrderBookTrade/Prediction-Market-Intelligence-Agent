@@ -1,6 +1,4 @@
-def main():
-    print("Hello from prediction-market-intelligence-agent!")
-
+from src.cli import app
 
 if __name__ == "__main__":
-    main()
+    app()
