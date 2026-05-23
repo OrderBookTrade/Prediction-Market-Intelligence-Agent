@@ -104,6 +104,23 @@ class EvidenceItem(BaseModel):
     credibility: str | None = None
 
 
+class CitedEvidence(BaseModel):
+    """A single evidence item with a verbatim quote verified against the source snippet.
+
+    `quote` MUST be a literal substring of the source snippet — enforced in
+    evidence_retriever._quote_valid() before this object is ever constructed.
+    """
+
+    claim: str                         # factual claim relevant to the question
+    quote: str                         # verbatim substring from snippet (validated)
+    source_url: str
+    publisher: str
+    published_at: str | None = None    # ISO-8601 or None
+    credibility: str = "LOW"           # HIGH / MEDIUM / LOW
+    label: str = ""                    # "yes_case" | "no_case" | "resolution"
+    confidence: str = "low"            # "high" | "medium" | "low"
+
+
 class ResolutionAnalysis(BaseModel):
     source: str
     deadline: str

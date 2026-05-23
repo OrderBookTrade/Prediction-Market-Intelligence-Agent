@@ -1,118 +1,354 @@
 """Node 2 — evidence_retriever.
 
-Generates search queries, fires them in parallel against Tavily,
-BM25-reranks results, and streams per-query log lines to the SSE feed.
+Generates 3 purpose-specific search queries (yes_case / no_case / resolution),
+fires them concurrently via Tavily, BM25-reranks results, then calls Claude
+(claude-sonnet, temperature=0) per hit to extract a verbatim-quoted claim.
+
+The NON-NEGOTIABLE anti-hallucination rule
+------------------------------------------
+Every quote extracted by the LLM is validated with _quote_valid() before
+a CitedEvidence object is created.  If the quote is not a literal substring
+of the source snippet, the evidence item is SILENTLY DROPPED and a warning
+is emitted.  Under no circumstances should a hallucinated quote survive.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
 
 from src.run_store import push_log
+from src.schemas import CitedEvidence
 
 logger = logging.getLogger(__name__)
 
+# ── Extraction tool schema (no $ref — flat for Anthropic API) ─────────────────
 
-def _generate_queries(question: str, description: str | None = None) -> list[str]:
-    """Produce 4-5 targeted search queries from the market question."""
-    base = question.rstrip("?")
-    queries = [
-        f"{base} {2026}",
-        f"{base} latest news",
-        f"{base} evidence probability",
-        f"{base} analysis prediction",
+EXTRACTION_TOOL: dict = {
+    "name": "extract_evidence",
+    "description": (
+        "Extract one key evidence item from a search-result snippet. "
+        "The 'quote' field MUST be copied verbatim from the snippet — "
+        "do NOT paraphrase or invent text."
+    ),
+    "input_schema": {
+        "type": "object",
+        "required": ["claim", "quote", "confidence", "label"],
+        "properties": {
+            "claim": {
+                "type": "string",
+                "description": "Factual claim (1-2 sentences) drawn from the snippet, relevant to the market question.",
+            },
+            "quote": {
+                "type": "string",
+                "description": (
+                    "Exact verbatim substring from the snippet that supports the claim. "
+                    "Must appear character-for-character in the content."
+                ),
+            },
+            "confidence": {
+                "type": "string",
+                "enum": ["high", "medium", "low"],
+                "description": "How strongly this evidence speaks to the market outcome.",
+            },
+            "label": {
+                "type": "string",
+                "enum": ["yes_case", "no_case", "resolution"],
+                "description": (
+                    "yes_case  — supports YES resolution; "
+                    "no_case   — supports NO resolution; "
+                    "resolution — clarifies how/when the market resolves."
+                ),
+            },
+        },
+    },
+}
+
+# ── Query generation ──────────────────────────────────────────────────────────
+
+def _generate_queries(
+    question: str,
+    resolution_source: str | None = None,
+    description: str | None = None,
+) -> list[tuple[str, str]]:
+    """Return exactly 3 (query_string, label) pairs.
+
+    Each label maps to a purpose:
+      yes_case   — evidence for YES
+      no_case    — evidence for NO / counter-case
+      resolution — who resolves, official source, deadline
+    """
+    base = question.rstrip("?").strip()
+    res_hint = f" site:{resolution_source}" if resolution_source else ""
+
+    yes_query = f"{base} evidence likely happening"
+    no_query  = f"{base} evidence unlikely won't happen"
+    res_query = f"{base} official decision announcement{res_hint}"
+
+    return [
+        (yes_query, "yes_case"),
+        (no_query,  "no_case"),
+        (res_query, "resolution"),
     ]
-    # Add description-derived query if available
-    if description and len(description) > 30:
-        # Extract first meaningful sentence
-        first = description.split(".")[0][:80]
-        if first not in queries:
-            queries.append(first)
-    return queries[:5]
 
+
+# ── Quote validation ──────────────────────────────────────────────────────────
+
+def _quote_valid(quote: str, snippet: str) -> bool:
+    """Return True iff `quote` is a literal (whitespace-normalised) substring of `snippet`.
+
+    Empty or whitespace-only quotes always return False.
+    """
+    if not quote or not quote.strip():
+        return False
+    norm_quote   = " ".join(quote.lower().split())
+    norm_snippet = " ".join(snippet.lower().split())
+    return norm_quote in norm_snippet
+
+
+# ── LLM extraction (standalone, patchable in tests) ──────────────────────────
+
+async def _call_extraction_llm(
+    hit: Any,          # SearchHit
+    question: str,
+    model: str,
+    api_key: str,
+) -> dict | None:
+    """Call Claude with tool_use to extract one evidence item from a search hit.
+
+    Returns the raw tool-input dict, or None on any failure.
+    This function is a standalone coroutine so tests can patch it easily.
+    """
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=api_key)
+    prompt = (
+        f"Market question: {question}\n\n"
+        f"Source: {hit.title} ({hit.publisher})\n"
+        f"URL: {hit.url}\n"
+        f"Content:\n{hit.snippet}\n\n"
+        "Extract the single most relevant piece of evidence from this snippet. "
+        "The 'quote' field must be copied verbatim from the content above."
+    )
+
+    loop = asyncio.get_event_loop()
+    try:
+        response = await loop.run_in_executor(
+            None,
+            lambda: client.messages.create(
+                model=model,
+                max_tokens=512,
+                temperature=0,
+                tools=[EXTRACTION_TOOL],
+                tool_choice={"type": "tool", "name": "extract_evidence"},
+                messages=[{"role": "user", "content": prompt}],
+            ),
+        )
+        for block in response.content:
+            if block.type == "tool_use" and block.name == "extract_evidence":
+                return block.input
+    except Exception as exc:
+        logger.warning("Extraction LLM failed for %s: %s", hit.url, exc)
+    return None
+
+
+# ── Extract + validate wrapper ────────────────────────────────────────────────
+
+async def _extract_and_validate(
+    hit: Any,          # SearchHit
+    question: str,
+    model: str,
+    api_key: str,
+) -> CitedEvidence | None:
+    """Call extraction LLM then enforce quote substring rule.
+
+    Returns CitedEvidence or None (logged warning on rejection).
+    """
+    data = await _call_extraction_llm(hit, question, model, api_key)
+    if data is None:
+        return None
+
+    quote = data.get("quote", "")
+    if not _quote_valid(quote, hit.snippet):
+        logger.warning(
+            "Quote validation FAILED for %s — dropping. quote=%r",
+            hit.url,
+            quote[:80],
+        )
+        return None
+
+    return CitedEvidence(
+        claim=data.get("claim", ""),
+        quote=quote,
+        source_url=hit.url,
+        publisher=hit.publisher,
+        published_at=hit.published_at,
+        credibility=hit.credibility,
+        label=data.get("label", hit.query_label or ""),
+        confidence=data.get("confidence", "low"),
+    )
+
+
+# ── Deduplication ─────────────────────────────────────────────────────────────
+
+_CONF_RANK = {"high": 3, "medium": 2, "low": 1}
+
+
+def _dedup_by_url(items: list[CitedEvidence]) -> list[CitedEvidence]:
+    """Keep the highest-confidence CitedEvidence per URL."""
+    best: dict[str, CitedEvidence] = {}
+    for ev in items:
+        key = ev.source_url
+        current = best.get(key)
+        if current is None or _CONF_RANK.get(ev.confidence, 0) > _CONF_RANK.get(current.confidence, 0):
+            best[key] = ev
+    return list(best.values())
+
+
+# ── No-key fallback ───────────────────────────────────────────────────────────
+
+def _fallback_evidence(hit: Any) -> CitedEvidence:
+    """Produce CitedEvidence without an LLM when ANTHROPIC_API_KEY is absent.
+
+    Uses the title as the claim and the first 100 chars of the snippet as the
+    quote — both are guaranteed to be valid substrings.
+    """
+    safe_quote = hit.snippet[:100] if hit.snippet else hit.title[:100]
+    return CitedEvidence(
+        claim=hit.title,
+        quote=safe_quote,
+        source_url=hit.url,
+        publisher=hit.publisher,
+        published_at=hit.published_at,
+        credibility=hit.credibility,
+        label=hit.query_label or "",
+        confidence="low",
+    )
+
+
+# ── Main node ─────────────────────────────────────────────────────────────────
 
 async def evidence_retriever_node(state: dict) -> dict:
     run_id: str = state["run_id"]
-    snapshot: dict = state["snapshot"]
+    snapshot: dict = state.get("snapshot") or {}
 
     from src.config import settings
-    from src.retrieval.search import TavilySearchClient
     from src.retrieval.reranker import bm25_rerank
+    from src.retrieval.search import TavilySearchClient
 
-    question = snapshot.get("question", "")
-    description = snapshot.get("description")
+    question        = snapshot.get("question", "")
+    description     = snapshot.get("description")
+    resolution_src  = snapshot.get("resolution_source")
 
-    queries = _generate_queries(question, description)
+    queries = _generate_queries(question, resolution_src, description)
 
-    await push_log(run_id, "Dispatching Tavily search queries...", "info")
+    await push_log(run_id, "Dispatching 3 Tavily search queries...", "info")
 
-    all_results = []
-    search_query_log = []
-
+    # ── Bail out early if no Tavily key ──────────────────────────────────────
     if not settings.tavily_api_key:
         await push_log(run_id, "  ⚠ TAVILY_API_KEY not set — skipping web search", "warn")
-        return {"search_results": [], "search_queries": [], "sources": []}
+        return {
+            "search_results":  [],
+            "search_queries":  [],
+            "sources":         [],
+            "cited_evidence":  [],
+        }
 
     client = TavilySearchClient(settings.tavily_api_key)
 
-    # Fire all queries concurrently
-    async def _run_query(idx: int, q: str):
-        results, took_ms = await client.search(q, max_results=4, query_idx=idx + 1)
-        return idx, q, results, took_ms
+    # ── Fire queries concurrently ─────────────────────────────────────────────
+    async def _run_query(idx: int, q: str, label: str):
+        results, took_ms = await client.search(
+            q, max_results=5, days_back=60, query_idx=idx, query_label=label
+        )
+        return idx, q, label, results, took_ms
 
-    tasks = [_run_query(i, q) for i, q in enumerate(queries)]
+    tasks = [_run_query(i + 1, q, label) for i, (q, label) in enumerate(queries)]
     completed = await asyncio.gather(*tasks, return_exceptions=True)
+
+    all_hits: list = []
+    query_log: list[dict] = []
 
     for item in completed:
         if isinstance(item, Exception):
             logger.warning("Search task failed: %s", item)
             continue
-        idx, q, results, took_ms = item
-        await push_log(run_id, f"  [{idx + 1}/{len(queries)}] \"{q[:60]}\"", "query")
-        await push_log(run_id, f"          → {len(results)} results · {took_ms}ms", "dim")
-        all_results.extend(results)
-        search_query_log.append({
-            "idx": idx + 1,
-            "query": q,
-            "results": len(results),
-            "took_ms": took_ms,
-        })
+        idx, q, label, hits, took_ms = item
+        await push_log(run_id, f"  [{idx}/{len(queries)}] [{label}] \"{q[:55]}\"", "query")
+        await push_log(run_id, f"          → {len(hits)} results · {took_ms}ms", "dim")
+        all_hits.extend(hits)
+        query_log.append({"idx": idx, "query": q, "label": label, "results": len(hits), "took_ms": took_ms})
 
-    total = len(all_results)
-    await push_log(run_id, f"Retrieved {total} sources, filtering by credibility...", "info")
+    await push_log(run_id, f"Retrieved {len(all_hits)} raw hits — reranking...", "info")
 
-    # Rerank and filter
-    reranked = bm25_rerank(all_results, question, top_k=12)
-    medium_plus = [r for r in reranked if r.credibility in ("HIGH", "MEDIUM")]
-    cited = medium_plus[:8] if medium_plus else reranked[:8]
+    # ── BM25 rerank and credibility filter ───────────────────────────────────
+    reranked = bm25_rerank(all_hits, question, top_k=12)
+    medium_plus = [h for h in reranked if h.credibility in ("HIGH", "MEDIUM")]
+    top_hits = medium_plus[:8] if medium_plus else reranked[:8]
 
-    await push_log(run_id, f"  ✓ {len(cited)} sources passed (≥ MEDIUM credibility)", "ok")
+    await push_log(run_id, f"  ✓ {len(top_hits)} sources passed credibility filter", "ok")
 
-    # Stream source previews
-    await push_log(run_id, "Reading top-ranked sources...", "info")
-    for r in cited[:6]:
-        domain = r.url.split("/")[2].removeprefix("www.") if "://" in r.url else r.url
-        await push_log(run_id, f"  {domain} — {r.title[:55]}", "dim")
+    # ── Extract evidence (LLM or fallback) ───────────────────────────────────
+    raw_evidence: list[CitedEvidence] = []
+
+    if not settings.anthropic_api_key:
+        await push_log(run_id, "  ⚠ ANTHROPIC_API_KEY not set — using title-based fallback evidence", "warn")
+        raw_evidence = [_fallback_evidence(h) for h in top_hits]
+    else:
+        await push_log(run_id, "Extracting claims from sources (claude-sonnet)...", "info")
+        extraction_tasks = [
+            _extract_and_validate(h, question, settings.claude_model_fast, settings.anthropic_api_key)
+            for h in top_hits
+        ]
+        results = await asyncio.gather(*extraction_tasks, return_exceptions=True)
+
+        for h, res in zip(top_hits, results):
+            if isinstance(res, Exception):
+                logger.warning("Extraction failed for %s: %s", h.url, res)
+            elif res is not None:
+                raw_evidence.append(res)
+            else:
+                logger.warning("Evidence dropped for %s (None result)", h.url)
+
+        await push_log(run_id, f"  ✓ {len(raw_evidence)}/{len(top_hits)} items passed quote validation", "ok")
+
+    # ── Dedup by URL ──────────────────────────────────────────────────────────
+    cited: list[CitedEvidence] = _dedup_by_url(raw_evidence)
+
+    # ── Stream previews ───────────────────────────────────────────────────────
+    await push_log(run_id, "Top evidence items:", "info")
+    for ev in cited[:6]:
+        tone = "✓YES" if ev.label == "yes_case" else "✗NO " if ev.label == "no_case" else " RES"
+        await push_log(run_id, f"  [{tone}] {ev.publisher} — {ev.claim[:55]}", "dim")
+
+    # ── Build backward-compat `search_results` for memo_writer & risk_critic ─
+    search_results_compat = [
+        {
+            "title":       ev.claim,
+            "url":         ev.source_url,
+            "content":     ev.quote,
+            "credibility": ev.credibility,
+        }
+        for ev in cited
+    ]
 
     sources_out = [
         {
-            "domain": r.url.split("/")[2].removeprefix("www.") if "://" in r.url else r.url,
-            "title": r.title,
-            "url": r.url,
-            "content": r.content,
-            "cred": r.credibility,
-            "used": True,
-            "q": r.query_idx,
+            "domain":  ev.publisher,
+            "title":   ev.claim,
+            "url":     ev.source_url,
+            "content": ev.quote,
+            "cred":    ev.credibility,
+            "label":   ev.label,
+            "conf":    ev.confidence,
         }
-        for r in cited
+        for ev in cited
     ]
 
     return {
-        "search_results": [
-            {"title": r.title, "url": r.url, "content": r.content, "credibility": r.credibility}
-            for r in cited
-        ],
-        "search_queries": search_query_log,
-        "sources": sources_out,
+        "search_results": search_results_compat,
+        "search_queries": query_log,
+        "sources":        sources_out,
+        "cited_evidence": [ev.model_dump() for ev in cited],
     }

@@ -82,12 +82,15 @@ class TestRiskCritic:
 
 class TestBM25Reranker:
     def _make_results(self, n: int):
-        from src.retrieval.search import SearchResult
+        from src.retrieval.search import SearchHit
         return [
-            SearchResult(
-                title=f"Title {i}",
+            SearchHit(
                 url=f"https://example.com/{i}",
-                content=f"Content about prediction markets and topic {i}",
+                title=f"Title {i}",
+                publisher=f"example.com",
+                published_at=None,
+                snippet=f"Content about prediction markets and topic {i}",
+                raw_text=f"Content about prediction markets and topic {i}",
                 score=1.0,
                 credibility="MEDIUM",
             )
@@ -106,11 +109,20 @@ class TestBM25Reranker:
 
     def test_relevant_doc_ranked_higher(self):
         """BM25 IDF needs N>2 to produce non-zero scores; pad corpus accordingly."""
-        from src.retrieval.search import SearchResult
+        from src.retrieval.search import SearchHit
         from src.retrieval.reranker import bm25_rerank
 
         def _sr(title, url, content):
-            return SearchResult(title, url, content, 1.0, "MEDIUM")
+            return SearchHit(
+                url=url,
+                title=title,
+                publisher=url.split("/")[2],
+                published_at=None,
+                snippet=content,
+                raw_text=content,
+                score=1.0,
+                credibility="MEDIUM",
+            )
 
         results = [
             _sr("Cats and dogs lifestyle", "https://a.com", "cats dogs pets animals"),

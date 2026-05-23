@@ -26,7 +26,8 @@ def bm25_rerank(results: list, query: str, top_k: int = 8) -> list:
         logger.warning("rank-bm25 not installed; skipping rerank")
         return results[:top_k]
 
-    corpus = [_tokenize(f"{r.title} {r.content}") for r in results]
+    # Support both SearchHit.snippet (Sprint 3+) and legacy .content attribute
+    corpus = [_tokenize(f"{r.title} {getattr(r, 'snippet', None) or getattr(r, 'content', '')}") for r in results]
     tokenized_query = _tokenize(query)
 
     try:

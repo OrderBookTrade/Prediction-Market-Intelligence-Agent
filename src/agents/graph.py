@@ -25,6 +25,7 @@ class AgentState(TypedDict):
     search_results: list[Any]
     search_queries: list[Any]
     sources: list[Any]
+    cited_evidence: list[Any]    # list[CitedEvidence.model_dump()] from evidence_retriever
     risk_flags: list[str]
     risk_details: dict[str, Any]
     memo: dict | None
@@ -64,6 +65,7 @@ async def run_analysis(condition_id: str, run_id: str) -> dict:
         "search_results": [],
         "search_queries": [],
         "sources": [],
+        "cited_evidence": [],
         "risk_flags": [],
         "risk_details": {},
         "memo": None,
