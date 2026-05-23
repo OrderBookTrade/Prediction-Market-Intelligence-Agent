@@ -47,3 +47,10 @@ htmlcov/
 logs/
 outputs/
 memos/
+
+# Data (runtime-generated, not source code)
+*.db
+*.sqlite
+*.sqlite3
+data/*
+!data/.gitkeep
