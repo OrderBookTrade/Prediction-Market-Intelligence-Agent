@@ -5,6 +5,8 @@ analyzes resolution rules and liquidity risk, and generates structured research 
 
 **This is decision support, not automated trading.**
 
+![Agent Dashboard UI](docs/Agent-Dashboard.png)
+
 ## Architecture
 
 ```
