@@ -16,6 +16,15 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     polymarket_base_url: str = "https://gamma-api.polymarket.com"
 
+    # LLM settings
+    claude_model: str = "claude-opus-4-5"
+    claude_model_fast: str = "claude-sonnet-4-5"  # cheaper, for extraction tasks
+
+    # API server
+    api_host: str = "0.0.0.0"
+    api_port: int = 8000
+    cors_origins: str = "*"  # comma-separated list
+
 
 settings = Settings()
 
