@@ -138,29 +138,29 @@ async def grade_memo(run_id: str) -> EvalGradeOut:
         condition_id=memo_row.condition_id,
     )
 
-    # Persist
+    # Persist — collect all fields inside session to avoid DetachedInstanceError
     def _save():
         with Session(engine) as s:
             row = upsert_eval_grade(s, grade)
             s.commit()
-            return row
+            s.refresh(row)
+            return {
+                "run_id": row.run_id,
+                "condition_id": row.condition_id,
+                "citation_score": row.citation_score,
+                "calibration_score": row.calibration_score,
+                "reasoning_score": row.reasoning_score,
+                "hedge_score": row.hedge_score,
+                "overall": row.overall,
+                "weighted_overall": row.weighted_overall,
+                "letter_grade": row.letter_grade,
+                "feedback": json.loads(row.feedback_json),
+                "model_name": row.model_name,
+                "created_at": row.created_at.isoformat(),
+            }
 
-    row = await run_in_threadpool(_save)
-
-    return EvalGradeOut(
-        run_id=row.run_id,
-        condition_id=row.condition_id,
-        citation_score=row.citation_score,
-        calibration_score=row.calibration_score,
-        reasoning_score=row.reasoning_score,
-        hedge_score=row.hedge_score,
-        overall=row.overall,
-        weighted_overall=row.weighted_overall,
-        letter_grade=row.letter_grade,
-        feedback=json.loads(row.feedback_json),
-        model_name=row.model_name,
-        created_at=row.created_at.isoformat(),
-    )
+    data = await run_in_threadpool(_save)
+    return EvalGradeOut(**data)
 
 
 @router.get("/grades", response_model=list[EvalGradeOut])
@@ -173,24 +173,24 @@ async def list_grades(limit: int = 50) -> list[EvalGradeOut]:
 
     def _load():
         with Session(engine) as s:
-            return list_eval_grades(s, limit=limit)
+            rows = list_eval_grades(s, limit=limit)
+            return [
+                {
+                    "run_id": r.run_id,
+                    "condition_id": r.condition_id,
+                    "citation_score": r.citation_score,
+                    "calibration_score": r.calibration_score,
+                    "reasoning_score": r.reasoning_score,
+                    "hedge_score": r.hedge_score,
+                    "overall": r.overall,
+                    "weighted_overall": r.weighted_overall,
+                    "letter_grade": r.letter_grade,
+                    "feedback": json.loads(r.feedback_json),
+                    "model_name": r.model_name,
+                    "created_at": r.created_at.isoformat(),
+                }
+                for r in rows
+            ]
 
-    rows = await run_in_threadpool(_load)
-
-    return [
-        EvalGradeOut(
-            run_id=r.run_id,
-            condition_id=r.condition_id,
-            citation_score=r.citation_score,
-            calibration_score=r.calibration_score,
-            reasoning_score=r.reasoning_score,
-            hedge_score=r.hedge_score,
-            overall=r.overall,
-            weighted_overall=r.weighted_overall,
-            letter_grade=r.letter_grade,
-            feedback=json.loads(r.feedback_json),
-            model_name=r.model_name,
-            created_at=r.created_at.isoformat(),
-        )
-        for r in rows
-    ]
+    data_list = await run_in_threadpool(_load)
+    return [EvalGradeOut(**d) for d in data_list]
