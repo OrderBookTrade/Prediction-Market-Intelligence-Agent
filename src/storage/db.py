@@ -17,6 +17,7 @@ from src.storage.models import (
     AgentRunORM,
     AuditLogORM,
     Base,
+    EvalGradeORM,
     MarketSnapshotHistory,
     MarketSnapshotORM,
     MemoORM,
@@ -253,3 +254,41 @@ def get_eval_summary(session: Session) -> dict:
         "brier_label": brier_label(brier_avg),
         "baseline_delta": baseline_delta,
     }
+
+
+# ── Eval grade persistence ─────────────────────────────────────────────────────
+
+def upsert_eval_grade(session: Session, grade) -> EvalGradeORM:
+    """Insert or replace an EvalGrade for run_id (unique constraint)."""
+    import json as _json
+
+    existing = session.query(EvalGradeORM).filter_by(run_id=grade.run_id).first()
+    if existing:
+        session.delete(existing)
+        session.flush()
+
+    row = EvalGradeORM(
+        run_id=grade.run_id,
+        condition_id=grade.condition_id,
+        citation_score=grade.citation_score,
+        calibration_score=grade.calibration_score,
+        reasoning_score=grade.reasoning_score,
+        hedge_score=grade.hedge_score,
+        overall=grade.overall,
+        weighted_overall=grade.weighted_overall,
+        letter_grade=grade.letter_grade,
+        feedback_json=_json.dumps(grade.feedback),
+        model_name=grade.model_name,
+        prompt_version=grade.prompt_version,
+    )
+    session.add(row)
+    return row
+
+
+def list_eval_grades(session: Session, limit: int = 50) -> list[EvalGradeORM]:
+    return (
+        session.query(EvalGradeORM)
+        .order_by(EvalGradeORM.created_at.desc())
+        .limit(limit)
+        .all()
+    )

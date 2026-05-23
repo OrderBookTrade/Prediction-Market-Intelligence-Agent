@@ -1,10 +1,11 @@
-"""GET /api/eval/summary  ·  GET /api/eval/history"""
+"""GET /api/eval/summary  ·  GET /api/eval/history  ·  POST /api/eval/grade/{run_id}  ·  GET /api/eval/grades"""
 
 from __future__ import annotations
 
+import json
 import logging
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
@@ -84,3 +85,112 @@ def _short_rec(rec: str) -> str:
         "research_more": "RESEARCH",
         "no_trade": "NO_TRADE",
     }.get(rec, rec.upper())
+
+
+# ── LLM Judge ─────────────────────────────────────────────────────────────────
+
+class EvalGradeOut(BaseModel):
+    run_id: str
+    condition_id: str
+    citation_score: float
+    calibration_score: float
+    reasoning_score: float
+    hedge_score: float
+    overall: float
+    weighted_overall: float
+    letter_grade: str
+    feedback: list[str]
+    model_name: str
+    created_at: str
+
+
+@router.post("/grade/{run_id}", response_model=EvalGradeOut)
+async def grade_memo(run_id: str) -> EvalGradeOut:
+    """Run the LLM-as-judge on a completed memo and persist the grade.
+
+    Idempotent — grading the same run_id twice replaces the previous grade.
+    """
+    from src.eval.judge import grade_memo as _grade
+    from src.storage.db import get_engine, list_eval_grades, upsert_eval_grade
+    from src.storage.models import MemoORM
+    from sqlalchemy.orm import Session
+
+    engine = get_engine()
+
+    # Load memo from DB
+    def _load():
+        with Session(engine) as s:
+            return s.query(MemoORM).filter_by(run_id=run_id).first()
+
+    memo_row = await run_in_threadpool(_load)
+    if memo_row is None:
+        raise HTTPException(status_code=404, detail=f"No memo found for run_id={run_id!r}")
+
+    try:
+        memo_dict = json.loads(memo_row.memo_json)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Memo JSON invalid: {exc}")
+
+    # Run judge
+    grade = await _grade(
+        memo_dict=memo_dict,
+        run_id=run_id,
+        condition_id=memo_row.condition_id,
+    )
+
+    # Persist
+    def _save():
+        with Session(engine) as s:
+            row = upsert_eval_grade(s, grade)
+            s.commit()
+            return row
+
+    row = await run_in_threadpool(_save)
+
+    return EvalGradeOut(
+        run_id=row.run_id,
+        condition_id=row.condition_id,
+        citation_score=row.citation_score,
+        calibration_score=row.calibration_score,
+        reasoning_score=row.reasoning_score,
+        hedge_score=row.hedge_score,
+        overall=row.overall,
+        weighted_overall=row.weighted_overall,
+        letter_grade=row.letter_grade,
+        feedback=json.loads(row.feedback_json),
+        model_name=row.model_name,
+        created_at=row.created_at.isoformat(),
+    )
+
+
+@router.get("/grades", response_model=list[EvalGradeOut])
+async def list_grades(limit: int = 50) -> list[EvalGradeOut]:
+    """Return all LLM-judge grades, newest first."""
+    from src.storage.db import get_engine, list_eval_grades
+    from sqlalchemy.orm import Session
+
+    engine = get_engine()
+
+    def _load():
+        with Session(engine) as s:
+            return list_eval_grades(s, limit=limit)
+
+    rows = await run_in_threadpool(_load)
+
+    return [
+        EvalGradeOut(
+            run_id=r.run_id,
+            condition_id=r.condition_id,
+            citation_score=r.citation_score,
+            calibration_score=r.calibration_score,
+            reasoning_score=r.reasoning_score,
+            hedge_score=r.hedge_score,
+            overall=r.overall,
+            weighted_overall=r.weighted_overall,
+            letter_grade=r.letter_grade,
+            feedback=json.loads(r.feedback_json),
+            model_name=r.model_name,
+            created_at=r.created_at.isoformat(),
+        )
+        for r in rows
+    ]

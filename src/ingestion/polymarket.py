@@ -100,3 +100,22 @@ class PolymarketClient:
         if not items:
             raise ValueError(f"No market found for conditionId={condition_id!r}")
         return MarketRaw.model_validate(items[0])
+
+    async def fetch_market_by_slug(self, slug: str) -> MarketRaw | None:
+        """Fetch a single Yes/No market by its URL slug."""
+        data = await self._get("/markets", params={"slug": slug, "limit": 1})
+        items = data if isinstance(data, list) else data.get("markets", [])
+        if not items:
+            return None
+        return MarketRaw.model_validate(items[0])
+
+    async def fetch_event_by_slug(self, slug: str) -> dict | None:
+        """Fetch an event (with nested markets array) by its URL slug.
+
+        Returns the raw event dict so callers can access title + markets list.
+        """
+        data = await self._get("/events", params={"slug": slug, "limit": 1})
+        items = data if isinstance(data, list) else data.get("events", [])
+        if not items:
+            return None
+        return items[0]  # raw dict: { title, slug, markets: [...] }

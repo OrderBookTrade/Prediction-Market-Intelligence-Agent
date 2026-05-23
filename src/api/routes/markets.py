@@ -9,7 +9,7 @@ from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -222,6 +222,123 @@ async def get_market(condition_id: str) -> MarketResponse:
     if row is None:
         raise HTTPException(status_code=404, detail=f"Market {condition_id!r} not found")
     return _orm_to_response(row, history)
+
+
+# ── URL resolver ──────────────────────────────────────────────────────────────
+
+class ResolveRequest(BaseModel):
+    url: str
+
+    @field_validator("url")
+    @classmethod
+    def must_be_polymarket(cls, v: str) -> str:
+        if "polymarket.com" not in v:
+            raise ValueError("URL must be a polymarket.com link")
+        return v.strip()
+
+
+class ResolveResponse(BaseModel):
+    type: str                        # "yesno" | "multi"
+    event_title: str | None = None   # populated for multi-outcome events
+    markets: list[MarketResponse]
+
+
+def _parse_polymarket_url(url: str) -> tuple[str, str]:
+    """Return (kind, slug) where kind is 'event' or 'market'."""
+    url = url.strip().rstrip("/")
+    # strip query string
+    url = url.split("?")[0]
+    for marker in ("polymarket.com/event/", "polymarket.com/market/"):
+        if marker in url:
+            kind = "event" if "/event/" in marker else "market"
+            slug = url.split(marker, 1)[1]
+            return kind, slug
+    raise ValueError(f"Cannot parse Polymarket URL: {url!r}")
+
+
+@router.post("/resolve", response_model=ResolveResponse)
+async def resolve_url(body: ResolveRequest) -> ResolveResponse:
+    """Parse a Polymarket URL and return market(s) ready for analysis.
+
+    - /event/{slug}  → multi-outcome event (type="multi")
+    - /market/{slug} → single Yes/No market  (type="yesno")
+    """
+    from src.ingestion.normalizer import normalize
+    from src.ingestion.polymarket import PolymarketClient
+    from src.storage.db import get_engine, get_price_history, upsert_snapshot
+    from sqlalchemy.orm import Session
+
+    try:
+        kind, slug = _parse_polymarket_url(body.url)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    engine = get_engine()
+
+    async with PolymarketClient() as client:
+
+        # ── Single Yes/No market ──────────────────────────────────────────
+        if kind == "market":
+            raw = await client.fetch_market_by_slug(slug)
+            if raw is None:
+                raise HTTPException(status_code=404, detail=f"Market {slug!r} not found")
+
+            try:
+                snap = normalize(raw)
+            except Exception as exc:
+                raise HTTPException(status_code=422, detail=f"Normalization failed: {exc}")
+
+            def _persist_and_hist():
+                with Session(engine) as s:
+                    upsert_snapshot(s, snap)
+                    s.commit()
+                    return get_price_history(s, snap.condition_id)
+
+            history = await run_in_threadpool(_persist_and_hist)
+            market_resp = _raw_to_response(snap, history, raw.one_day_price_change)
+            return ResolveResponse(type="yesno", markets=[market_resp])
+
+        # ── Multi-outcome event ───────────────────────────────────────────
+        event = await client.fetch_event_by_slug(slug)
+        if event is None:
+            raise HTTPException(status_code=404, detail=f"Event {slug!r} not found")
+
+        event_title: str = event.get("title") or slug
+        raw_markets: list[dict] = event.get("markets", [])
+
+        if not raw_markets:
+            raise HTTPException(status_code=404, detail="Event has no markets")
+
+        from src.schemas import MarketRaw
+
+        responses: list[MarketResponse] = []
+        for item in raw_markets:
+            try:
+                raw = MarketRaw.model_validate(item)
+                snap = normalize(raw)
+
+                def _ph(cid=snap.condition_id):
+                    with Session(engine) as s:
+                        upsert_snapshot(s, snap)
+                        s.commit()
+                        return get_price_history(s, cid)
+
+                hist = await run_in_threadpool(_ph)
+                responses.append(_raw_to_response(snap, hist, raw.one_day_price_change))
+            except Exception as exc:
+                logger.warning("Skipping market in event: %s", exc)
+
+        if not responses:
+            raise HTTPException(status_code=422, detail="No valid markets in event")
+
+        # Sort by YES price descending (most likely outcome first)
+        responses.sort(key=lambda m: m.yes_price or 0, reverse=True)
+
+        return ResolveResponse(
+            type="multi",
+            event_title=event_title,
+            markets=responses,
+        )
 
 
 @router.post("/ingest", status_code=202)

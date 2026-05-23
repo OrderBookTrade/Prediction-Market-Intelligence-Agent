@@ -1,4 +1,4 @@
-"""SQLAlchemy ORM models — Sprint 1 tables + Sprint 2 agent tables."""
+"""SQLAlchemy ORM models — Sprint 1 tables + Sprint 2 agent tables + Sprint 5 eval grades."""
 
 from datetime import datetime, timezone
 
@@ -138,3 +138,32 @@ class PredictionHistoryORM(Base):
         default=lambda: datetime.now(timezone.utc),
     )
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+# ── Sprint 5 ──────────────────────────────────────────────────────────────────
+
+class EvalGradeORM(Base):
+    """LLM-as-judge grades for a completed ResearchMemo."""
+
+    __tablename__ = "eval_grades"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String, nullable=False, index=True, unique=True)
+    condition_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+
+    citation_score: Mapped[float] = mapped_column(Float)
+    calibration_score: Mapped[float] = mapped_column(Float)
+    reasoning_score: Mapped[float] = mapped_column(Float)
+    hedge_score: Mapped[float] = mapped_column(Float)
+    overall: Mapped[float] = mapped_column(Float)
+    weighted_overall: Mapped[float] = mapped_column(Float)
+    letter_grade: Mapped[str] = mapped_column(String(2))    # A / B / C / D / F
+
+    feedback_json: Mapped[str] = mapped_column(Text)        # JSON list[str]
+    model_name: Mapped[str] = mapped_column(String)
+    prompt_version: Mapped[str] = mapped_column(String, default="judge-v1")
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )
