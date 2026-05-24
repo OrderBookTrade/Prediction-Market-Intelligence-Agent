@@ -10,7 +10,6 @@ RUN mkdir -p /app/data
 
 RUN uv sync --no-dev --frozen
 
-# Add venv to PATH so Railway can locate uvicorn
 ENV PATH="/app/.venv/bin:$PATH"
 
 # Verify the app can be imported before shipping
