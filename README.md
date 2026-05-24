@@ -51,18 +51,42 @@ Polymarket Gamma API
 
 ## Quick Start
 
+### API Server (Local Development)
+
+The agent runs as a FastAPI backend. To start the local server with hot-reloading:
+
 ```bash
 uv sync
 export ANTHROPIC_API_KEY="..."
+uv run uvicorn src.api.app:app --host 0.0.0.0 --port 8000 --reload
+```
+*API docs will be available at `http://localhost:8000/docs`*
 
+### CLI Usage
+
+```bash
 # Single market memo
-python main.py --market <condition_id>
+uv run python main.py --market <condition_id>
 
 # Interactive mode
-python main.py --interactive
+uv run python main.py --interactive
 
 # Scan top AI/Crypto markets
-python main.py --scan
+uv run python main.py --scan
+```
+
+## Deployment
+
+This project is configured for deployment on [Railway](https://railway.app/). 
+
+**To deploy:**
+1. Connect your GitHub repository to Railway.
+2. Railway will automatically detect `railway.json` / `Dockerfile` and build the service.
+3. Add your `ANTHROPIC_API_KEY` to the project variables in the Railway dashboard.
+
+Alternatively, using the Railway CLI:
+```bash
+railway up
 ```
 
 ## Eval
