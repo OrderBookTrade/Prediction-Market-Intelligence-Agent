@@ -2,20 +2,14 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install uv (pip is available in python:3.11-slim)
+# Install uv — pip is available in python:3.11-slim
 RUN pip install uv --quiet
 
-# Copy dependency manifest first (cache layer)
-COPY pyproject.toml uv.lock ./
-
-# Install production deps into .venv
-RUN uv sync --no-dev --frozen
-
-# Copy source code
+# Copy everything first so hatchling can find README.md during package build
 COPY . .
 
-# Expose dynamic port (Railway injects $PORT)
-EXPOSE 8000
+# Install production deps (builds local package via hatchling)
+RUN uv sync --no-dev --frozen
 
-# Use uv run so the .venv is automatically activated
+# Use uv run so .venv is automatically on PATH
 CMD ["sh", "-c", "uv run uvicorn src.api.app:app --host 0.0.0.0 --port ${PORT:-8000}"]
