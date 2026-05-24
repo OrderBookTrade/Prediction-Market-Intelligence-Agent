@@ -1,1 +1,1 @@
-web: /app/.venv/bin/uvicorn src.api.app:app --host 0.0.0.0 --port $PORT
+web: sh -c '/app/.venv/bin/uvicorn src.api.app:app --host 0.0.0.0 --port $PORT'
