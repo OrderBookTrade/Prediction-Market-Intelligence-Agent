@@ -36,21 +36,50 @@
 
 ---
 
-## 2026-05-24 · Sprint 4 prep
+## 2026-05-24 · Sprint 5 — LLM-as-judge eval pipeline
 
-**State of codebase:**
+**What shipped:**
 
-Agents wired: `market_analyzer → evidence_retriever → risk_critic → memo_writer`  
-Frontend tabs: Discovery · Watchlist · Performance · Settings  
-Real data: market feed live from Gamma API · URL import works end-to-end  
+- **`src/eval/judge.py`** — LLM-as-judge with 4 scoring dimensions:
+  - `calibration_score` (structural, no LLM): `10 × (1 - |agent_est - market_prob| / 0.40)`.
+    Decoupled from LLM deliberately — calibration is a math fact, not a judgment call.
+  - `citation_score` (LLM): are claims backed by real URLs, not `None`/`"N/A"`?
+  - `reasoning_score` (LLM): deep engagement with uncertainties, no weasel words?
+  - `hedge_score` (LLM): appropriate uncertainty expression, not overconfident?
+  - `weighted_overall`: `cal×0.30 + cit×0.30 + rea×0.25 + hedge×0.15`
+  - `letter_grade`: A/B/C/D/F based on `weighted_overall`
+  - Fallback to 5.0 scores when API key unavailable — structural calibration always works.
+  - `_call_judge_llm` is a standalone coroutine — monkeypatched in all tests.
 
-**Next priorities (in order):**
+- **`EvalGradeORM`** — new table `eval_grades` with unique constraint on `run_id`.
+  `upsert_eval_grade` deletes-then-inserts for idempotent re-grading.
 
-1. **Sprint 5 — Evals pipeline** (the moat): Brier score tracking, calibration curve,
-   LLM-as-judge for memo quality. This is what separates the project from a toy.
-2. **Sprint 4 — Search UX**: Accept Polymarket URLs directly in the search bar without
-   opening a modal. Low effort, high polish.
-3. **Tiered models**: cheap default (haiku/sonnet) + user brings own API key in localStorage.
-4. **Devlog discipline**: Keep writing here. Recruiters at Anthropic/OpenAI read the git log.
+- **`POST /api/eval/grade/{run_id}`** + **`GET /api/eval/grades`** — grade a memo by
+  run_id, persist to DB, return structured JSON. Collect all fields inside session
+  to avoid `DetachedInstanceError`.
+
+- **12 new tests** in `test_eval_judge.py`: calibration math, Pydantic model invariants,
+  letter grades, feedback validation, excellent/poor memo paths, LLM failure fallback.
+
+- **Frontend** `PerformanceDashboard.tsx`: `JudgeGradesPanel` component with score bars,
+  letter grade chip, top feedback item on hover. Wired to `GET /api/eval/grades`.
+
+**Live grading results** (3 memos):
+  - `0090212d`: **C** — weighted=6.05, cal=8.5 (3pp gap), LLM unavailable → fallback 5.0
+  - `b6b5ec4d`: **C** — same pattern
+  - `ae362f2c`: **F** — weighted=3.5, **cal=0.0** (40pp+ divergence from market price)
+
+The F grade is the system working: that memo's agent estimate was badly miscalibrated.
+
+**Metrics:** 45 tests passing · 0 TS errors
+
+---
+
+## Next sprint ideas
+
+1. **Sprint 4 — Search UX**: Accept Polymarket URLs directly in the search bar.
+2. **Tiered models**: haiku default + user brings own API key in localStorage.
+3. **Auto-resolution**: cron job that checks resolved markets, fills `outcome` + Brier score.
+4. **Calibration curve**: `/api/eval/calibration` endpoint with bin-averaged accuracy.
 
 ---
