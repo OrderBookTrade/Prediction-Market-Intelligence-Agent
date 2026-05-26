@@ -11,6 +11,8 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, field_validator
 
+from src.agents.risk_critic import AMBIGUITY_KEYWORDS, TRUSTED_SOURCES
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/markets", tags=["markets"])
@@ -36,7 +38,7 @@ class MarketResponse(BaseModel):
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def _compute_risk_flags(yes_price, liquidity, spread, end_date_str, volume) -> list[str]:
+def _compute_risk_flags(yes_price, liquidity, spread, end_date_str, volume, rules_text: str = "", res_source: str = "") -> list[str]:
     flags: list[str] = []
     liq = liquidity or 0
     vol = volume or 0
@@ -56,13 +58,24 @@ def _compute_risk_flags(yes_price, liquidity, spread, end_date_str, volume) -> l
             pass
     if vol > 0 and liq > 0 and vol / liq > 15:
         flags.append("HIGH_VOLUME")
+        
+    if rules_text or res_source:
+        rules_lower = (rules_text or "").lower()
+        res_lower = (res_source or "").lower()
+        trusted = any(t in res_lower or t in rules_lower for t in TRUSTED_SOURCES)
+        ambiguities = [kw for kw in AMBIGUITY_KEYWORDS if kw in rules_lower]
+        
+        if not trusted or ambiguities:
+            flags.append("AMBIGUOUS_RULES")
+            
     return flags
 
 
 def _orm_to_response(orm, history: list[float]) -> MarketResponse:
     end_iso = orm.end_date.strftime("%Y-%m-%d") if orm.end_date else None
     flags = _compute_risk_flags(
-        orm.yes_price, orm.liquidity, orm.spread, end_iso, orm.volume
+        orm.yes_price, orm.liquidity, orm.spread, end_iso, orm.volume,
+        rules_text=orm.raw_rules_text, res_source=orm.resolution_source
     )
     change_24h = None
     if len(history) >= 2:
@@ -86,7 +99,8 @@ def _orm_to_response(orm, history: list[float]) -> MarketResponse:
 def _raw_to_response(snap, history: list[float], change_24h: float | None) -> MarketResponse:
     end_iso = snap.end_date.strftime("%Y-%m-%d") if snap.end_date else None
     flags = _compute_risk_flags(
-        snap.yes_price, snap.liquidity, snap.spread, end_iso, snap.volume
+        snap.yes_price, snap.liquidity, snap.spread, end_iso, snap.volume,
+        rules_text=snap.raw_rules_text, res_source=snap.resolution_source
     )
     if change_24h is None and len(history) >= 2:
         change_24h = round(history[-1] - history[-2], 4)
