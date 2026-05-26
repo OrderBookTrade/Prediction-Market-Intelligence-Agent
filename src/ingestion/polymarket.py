@@ -99,7 +99,11 @@ class PolymarketClient:
         items = data if isinstance(data, list) else data.get("markets", [])
         if not items:
             raise ValueError(f"No market found for conditionId={condition_id!r}")
-        return MarketRaw.model_validate(items[0])
+        for item in items:
+            raw = MarketRaw.model_validate(item)
+            if raw.condition_id == condition_id or raw.id == condition_id:
+                return raw
+        raise ValueError(f"No exact market found for conditionId={condition_id!r}")
 
     async def fetch_market_by_slug(self, slug: str) -> MarketRaw | None:
         """Fetch a single Yes/No market by its URL slug."""

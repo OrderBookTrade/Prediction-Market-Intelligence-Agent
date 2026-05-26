@@ -141,6 +141,41 @@ class TestPolymarketClient:
         assert markets[0].condition_id == "0xabc"
         assert markets[0].question == "Test market?"
 
+    async def test_fetch_market_detail_requires_exact_condition_id(self):
+        """Gamma can return non-matching rows; detail fetch must not accept them."""
+        payload = [
+            {
+                "id": "wrong-id",
+                "conditionId": "0xwrong",
+                "question": "Wrong market?",
+            },
+            {
+                "id": "right-id",
+                "conditionId": "0xright",
+                "question": "Right market?",
+            },
+        ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=payload)
+
+        client = self._make_client(handler)
+        market = await client.fetch_market_detail("0xright")
+
+        assert market.condition_id == "0xright"
+        assert market.question == "Right market?"
+
+    async def test_fetch_market_detail_raises_when_no_exact_condition_id(self):
+        payload = [{"id": "wrong-id", "conditionId": "0xwrong"}]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=payload)
+
+        client = self._make_client(handler)
+
+        with pytest.raises(ValueError, match="No exact market found"):
+            await client.fetch_market_detail("0xmissing")
+
 
 # ── DB upsert ─────────────────────────────────────────────────────────────────
 

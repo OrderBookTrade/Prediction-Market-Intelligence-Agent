@@ -103,12 +103,29 @@ MEMO_TOOL: dict = {
 }
 
 
-def _build_prompt(snapshot: dict, search_results: list[dict], risk_details: dict) -> str:
+def _build_prompt(
+    snapshot: dict,
+    search_results: list[dict],
+    risk_details: dict,
+    sources: list[dict] | None = None,
+) -> str:
     yes_price = snapshot.get("yes_price", 0.5) or 0.5
-    evidence_text = "\n".join(
-        f"[{i+1}] {r.get('title', '')} ({r.get('url', '')})\n    {r.get('content', '')[:300]}"
-        for i, r in enumerate(search_results[:8])
-    ) or "No external evidence retrieved."
+    labeled_sources = sources or []
+    if labeled_sources:
+        evidence_text = "\n".join(
+            f"[{i+1}] LABEL={s.get('label') or 'unknown'} CRED={s.get('cred') or '?'} "
+            f"SOURCE={s.get('domain') or s.get('url')}\n"
+            f"    CLAIM: {s.get('title', '')}\n"
+            f"    QUOTE: {s.get('content', '')[:300]}"
+            for i, s in enumerate(labeled_sources[:8])
+        )
+    else:
+        evidence_text = "\n".join(
+            f"[{i+1}] LABEL=unknown CRED={r.get('credibility') or '?'} SOURCE={r.get('url', '')}\n"
+            f"    CLAIM: {r.get('title', '')}\n"
+            f"    QUOTE: {r.get('content', '')[:300]}"
+            for i, r in enumerate(search_results[:8])
+        ) or "No external evidence retrieved."
 
     risk_summary = "\n".join(
         f"- {k.capitalize()} risk: {v.get('level','?').upper()} — {v.get('note','')}"
@@ -123,6 +140,11 @@ RULES:
 - Your agent_estimate must be derived from the evidence, not anchored to the market price
 - Use temperature reasoning: consider base rates, recent signals, and counter-evidence
 - Be conservative: prefer NO_TRADE if evidence quality is thin
+- Respect evidence labels: LABEL=yes_case supports YES, LABEL=no_case supports NO,
+  and LABEL=resolution only clarifies rules/source/deadline. Do not put NO evidence
+  into yes_case or YES evidence into no_case.
+- If one side has no labeled evidence, include one explicit insufficient-evidence item
+  for that side instead of borrowing evidence from the other side.
 
 MARKET:
 Question: {snapshot.get('question')}
@@ -199,7 +221,7 @@ async def memo_writer_node(state: dict) -> dict:
     import anthropic
 
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
-    prompt = _build_prompt(snapshot, search_results, risk_details)
+    prompt = _build_prompt(snapshot, search_results, risk_details, sources)
     input_hash = hashlib.sha256(prompt.encode()).hexdigest()[:16]
 
     memo_raw: dict | None = None
