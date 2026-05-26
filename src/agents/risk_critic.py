@@ -81,7 +81,7 @@ async def risk_critic_node(state: dict) -> dict:
     trusted = any(t in res_source or t in rules for t in TRUSTED_SOURCES)
     ambiguities = [kw for kw in AMBIGUITY_KEYWORDS if kw in rules]
     if not res_source:
-        res_level, res_note = "high", "No resolution source specified"
+        res_level, res_note = "medium", "No resolution source specified"
     elif not trusted:
         res_level, res_note = "medium", "Resolution source not on trusted list — verify manually"
     elif ambiguities:

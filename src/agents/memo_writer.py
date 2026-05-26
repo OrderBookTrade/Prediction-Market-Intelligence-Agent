@@ -164,14 +164,15 @@ Generate a complete research memo using the write_research_memo tool.
 """
 
 
-def _fallback_memo(snapshot: dict, run_id: str, search_queries: list = [], sources_found: int = 0) -> dict:
+def _fallback_memo(snapshot: dict, run_id: str, search_queries: list = None) -> dict:
     yes_price = snapshot.get("yes_price", 0.5) or 0.5
+    queries = [q.get("query", "") for q in (search_queries or [])]
     return {
         "run_id": run_id,
         "condition_id": snapshot.get("condition_id", ""),
         "market_question": snapshot.get("question", ""),
         "market_probability": yes_price,
-        "agent_estimate": yes_price,
+        "agent_estimate": 0.50,
         "edge": 0.0,
         "confidence": "uncertain",
         "yes_case": [],
@@ -189,8 +190,8 @@ def _fallback_memo(snapshot: dict, run_id: str, search_queries: list = [], sourc
         "key_uncertainties": ["Analysis failed — rerun with valid API keys"],
         "model_name": "fallback",
         "prompt_version": PROMPT_VERSION,
-        "search_queries": search_queries,
-        "sources_found": sources_found,
+        "search_queries": queries,
+        "sources_found": 0,
     }
 
 
@@ -214,7 +215,7 @@ async def memo_writer_node(state: dict) -> dict:
 
     if not settings.anthropic_api_key:
         await push_log(run_id, "  ⚠ ANTHROPIC_API_KEY not set — using fallback memo", "warn")
-        memo = _fallback_memo(snapshot, run_id, [q.get("query", "") for q in search_queries], len(search_results))
+        memo = _fallback_memo(snapshot, run_id, search_queries)
         _finalize(state, memo, run_id, condition_id, yes_price, search_queries, sources, len(search_results))
         return {"memo": memo}
 
@@ -249,6 +250,11 @@ async def memo_writer_node(state: dict) -> dict:
                 memo_raw = tool_block.input
                 break
         except Exception as exc:
+            if "AuthenticationError" in str(type(exc)) or "401" in str(exc):
+                logger.warning("Claude AuthenticationError: %s", exc)
+                if attempt == 0:
+                    await push_log(run_id, "  ⚠ ANTHROPIC_API_KEY invalid or unauthorized", "error")
+                break
             logger.warning("Claude call attempt %d failed: %s", attempt + 1, exc)
             if attempt == 0:
                 await push_log(run_id, f"  ⚠ retry after error: {exc}", "warn")
@@ -257,7 +263,7 @@ async def memo_writer_node(state: dict) -> dict:
 
     if not memo_raw:
         await push_log(run_id, "  ✗ Memo generation failed — using fallback", "warn")
-        memo = _fallback_memo(snapshot, run_id, [q.get("query", "") for q in search_queries], len(search_results))
+        memo = _fallback_memo(snapshot, run_id, search_queries)
     else:
         edge = round(memo_raw.get("agent_estimate", yes_price) - yes_price, 4)
         memo = {
