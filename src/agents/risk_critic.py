@@ -89,8 +89,7 @@ async def risk_critic_node(state: dict) -> dict:
     else:
         res_level, res_note = "low", "Resolution source is on the trusted list"
 
-    clarity_label = "MEDIUM" if res_level == "medium" else res_level.upper()
-    await push_log(run_id, f"  Risk check: resolution clarity = {clarity_label}", "ok" if res_level == "low" else "warn")
+    await push_log(run_id, f"  Risk check: resolution risk = {res_level.upper()}", "ok" if res_level == "low" else "warn")
 
     risk_details["resolution"] = {"level": res_level, "note": res_note, "ambiguities": ambiguities}
 
@@ -127,7 +126,7 @@ async def risk_critic_node(state: dict) -> dict:
     if volume > 0 and liquidity > 0 and volume / liquidity > 15:
         risk_flags.append("HIGH_VOLUME")
 
-    await push_log(run_id, f"Risk assessment: {len(risk_flags)} flag(s) · resolution={res_level.upper()}", "info")
+    await push_log(run_id, f"Risk assessment: {len(risk_flags)} flag(s) · resolution risk={res_level.upper()}", "info")
 
     return {
         "risk_flags": risk_flags,
