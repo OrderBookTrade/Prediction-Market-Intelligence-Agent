@@ -106,8 +106,9 @@ class TavilySearchClient:
                 ),
             )
         except Exception as exc:
+            took_ms = int((time.monotonic() - t0) * 1000)
             logger.warning("Tavily search failed for %r: %s", query, exc)
-            return [], 0
+            return [], took_ms
 
         took_ms = int((time.monotonic() - t0) * 1000)
 

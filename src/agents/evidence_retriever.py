@@ -20,6 +20,7 @@ from typing import Any
 
 from src.run_store import push_log
 from src.schemas import CitedEvidence
+from src.utils.secrets import safe_secret_info
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +115,15 @@ def _generate_queries_template(
         (f"{base} unlikely obstacles analysis", "no_case"),
         (f"{base} official announcement{res_hint}", "resolution"),
     ]
+
+
+def _generate_queries(
+    question: str,
+    resolution_source: str | None = None,
+    description: str | None = None,
+) -> list[tuple[str, str]]:
+    """Backward-compatible alias for tests and deterministic fallback use."""
+    return _generate_queries_template(question, resolution_source, description)
 
 
 async def _generate_queries_llm(
@@ -321,17 +331,54 @@ async def evidence_retriever_node(state: dict) -> dict:
     description     = snapshot.get("description")
     resolution_src  = snapshot.get("resolution_source")
 
-    # ── Generate queries: LLM if key available, template fallback otherwise ──
-    if settings.anthropic_api_key:
+    anthropic_info = safe_secret_info(settings.anthropic_api_key, expected_prefix="sk-ant-")
+
+    # ── Generate queries: LLM if key appears usable, template fallback otherwise ──
+    if anthropic_info["present"] and anthropic_info["prefix_ok"]:
         await push_log(run_id, "Generating search queries via Claude...", "info")
+        await push_log(
+            run_id,
+            (
+                "[anthropic] caller=query_planner "
+                f"key_present={anthropic_info['present']} "
+                f"key_prefix={anthropic_info['prefix']} "
+                f"key_length={anthropic_info['length']} "
+                f"fingerprint={anthropic_info['fingerprint']} "
+                f"model={settings.claude_model_fast}"
+            ),
+            "dim",
+        )
         queries = await _generate_queries_llm(
             question, description, resolution_src,
             settings.claude_model_fast, settings.anthropic_api_key,
         )
     else:
+        await push_log(
+            run_id,
+            (
+                "[anthropic] caller=query_planner skipped "
+                f"key_present={anthropic_info['present']} "
+                f"key_prefix={anthropic_info['prefix']} "
+                f"key_length={anthropic_info['length']} "
+                f"fingerprint={anthropic_info['fingerprint']}"
+            ),
+            "warn",
+        )
         queries = _generate_queries_template(question, resolution_src, description)
 
     await push_log(run_id, "Dispatching 3 Tavily search queries...", "info")
+    key_info = safe_secret_info(settings.tavily_api_key, expected_prefix="tvl")
+    await push_log(
+        run_id,
+        (
+            "[tavily] caller=evidence_retriever "
+            f"key_present={key_info['present']} "
+            f"key_prefix={key_info['prefix']} "
+            f"key_length={key_info['length']} "
+            f"fingerprint={key_info['fingerprint']}"
+        ),
+        "dim",
+    )
 
     # ── Bail out early if no Tavily key ──────────────────────────────────────
     if not settings.tavily_api_key:
@@ -368,6 +415,8 @@ async def evidence_retriever_node(state: dict) -> dict:
         all_hits.extend(hits)
         query_log.append({"idx": idx, "query": q, "label": label, "results": len(hits), "took_ms": took_ms})
 
+    await push_log(run_id, f"Search requests executed: {len(query_log)}/{len(queries)}", "info")
+
     await push_log(run_id, f"Retrieved {len(all_hits)} raw hits — reranking...", "info")
 
     # ── BM25 rerank and credibility filter ───────────────────────────────────
@@ -380,8 +429,8 @@ async def evidence_retriever_node(state: dict) -> dict:
     # ── Extract evidence (LLM or fallback) ───────────────────────────────────
     raw_evidence: list[CitedEvidence] = []
 
-    if not settings.anthropic_api_key:
-        await push_log(run_id, "  ⚠ ANTHROPIC_API_KEY not set — using title-based fallback evidence", "warn")
+    if not anthropic_info["present"] or not anthropic_info["prefix_ok"]:
+        await push_log(run_id, "  ⚠ Anthropic unavailable — using title-based fallback evidence", "warn")
         raw_evidence = [_fallback_evidence(h) for h in top_hits]
     else:
         await push_log(run_id, "Extracting claims from sources (claude-sonnet)...", "info")

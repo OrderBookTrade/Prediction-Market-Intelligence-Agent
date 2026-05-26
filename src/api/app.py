@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.routes.agent import router as agent_router
+from src.api.routes.debug import router as debug_router
 from src.api.routes.eval import router as eval_router
 from src.api.routes.markets import router as markets_router
 from src.api.routes.memos import router as memos_router
@@ -51,6 +52,7 @@ app.include_router(markets_router, prefix="/api")
 app.include_router(memos_router, prefix="/api")
 app.include_router(agent_router, prefix="/api")
 app.include_router(eval_router, prefix="/api")
+app.include_router(debug_router, prefix="/api")
 
 
 @app.get("/health")
