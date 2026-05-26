@@ -65,6 +65,7 @@ class AgentRunORM(Base):
     condition_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
     status: Mapped[str] = mapped_column(String, default="queued")  # queued|running|done|error
     error_message: Mapped[str | None] = mapped_column(Text)
+    metrics_json: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),

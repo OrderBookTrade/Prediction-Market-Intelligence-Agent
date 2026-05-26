@@ -98,26 +98,55 @@ class Recommendation(str, Enum):
     CANDIDATE = "candidate_opportunity"
 
 
+class EvidenceSide(str, Enum):
+    YES = "yes"
+    NO = "no"
+    RESOLUTION = "resolution"
+
+
+class EvidenceSupportLevel(str, Enum):
+    SNIPPET_SUPPORTED = "snippet_supported"
+    RAW_CONTENT_SUPPORTED = "raw_content_supported"
+    QUOTE_VERIFIED = "quote_verified"
+    PRIMARY_SOURCE_VERIFIED = "primary_source_verified"
+
+
+class SourceObject(BaseModel):
+    """Normalized source returned from search before claim extraction."""
+
+    source_id: str
+    url: str
+    domain: str
+    title: str
+    snippet: str
+    query_id: int
+    query_label: str
+    credibility: str = "LOW"
+    raw_content: str | None = None
+
+
 class EvidenceItem(BaseModel):
     claim: str
     source: str | None = None
     credibility: str | None = None
+    source_id: str | None = None
+    side: EvidenceSide | None = None
+    support_level: EvidenceSupportLevel | None = None
 
 
 class CitedEvidence(BaseModel):
-    """A single evidence item with a verbatim quote verified against the source snippet.
+    """A single evidence item backed by a normalized source."""
 
-    `quote` MUST be a literal substring of the source snippet — enforced in
-    evidence_retriever._quote_valid() before this object is ever constructed.
-    """
-
+    source_id: str
     claim: str                         # factual claim relevant to the question
-    quote: str                         # verbatim substring from snippet (validated)
+    quote: str                         # source-supported quote/snippet text
     source_url: str
     publisher: str
     published_at: str | None = None    # ISO-8601 or None
     credibility: str = "LOW"           # HIGH / MEDIUM / LOW
     label: str = ""                    # "yes_case" | "no_case" | "resolution"
+    side: EvidenceSide = EvidenceSide.RESOLUTION
+    support_level: EvidenceSupportLevel = EvidenceSupportLevel.SNIPPET_SUPPORTED
     confidence: str = "low"            # "high" | "medium" | "low"
 
 
