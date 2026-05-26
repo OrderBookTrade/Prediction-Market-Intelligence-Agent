@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-
+from fastapi.responses import RedirectResponse
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -12,6 +12,7 @@ from src.api.routes.agent import router as agent_router
 from src.api.routes.eval import router as eval_router
 from src.api.routes.markets import router as markets_router
 from src.api.routes.memos import router as memos_router
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Prediction Market Intelligence Agent API",
-    version="0.2.0",
+    version="0.1.0",
     description="Real-time Polymarket data + LangGraph agent analysis",
     lifespan=lifespan,
 )
@@ -54,4 +55,18 @@ app.include_router(eval_router, prefix="/api")
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok", "version": app.version}
+    return {
+        "status": "ok",
+        "version": app.version,
+        "service": "PMI Agent Backend API Service)",
+        "serverTime": int(time.time()),
+        "title": app.title,
+        "description": app.description,
+        "github": "https://github.com/orderbooktrade/prediction-market-intelligence-agent",
+        "telegram": "https://t.me/iambaice",
+    }
+
+
+@app.get("/")
+async def root():
+    return RedirectResponse(url="/health")
