@@ -67,30 +67,110 @@ EXTRACTION_TOOL: dict = {
 
 # ── Query generation ──────────────────────────────────────────────────────────
 
-def _generate_queries(
+# Tool schema for LLM-based query generation
+_QUERY_GEN_TOOL: dict = {
+    "name": "generate_search_queries",
+    "description": "Generate three targeted web search queries to research a prediction market.",
+    "input_schema": {
+        "type": "object",
+        "required": ["yes_case", "no_case", "resolution"],
+        "properties": {
+            "yes_case": {
+                "type": "string",
+                "description": (
+                    "Search query to find recent news/evidence supporting the YES outcome. "
+                    "Use specific, newsworthy keywords — NOT the market question verbatim."
+                ),
+            },
+            "no_case": {
+                "type": "string",
+                "description": (
+                    "Search query to find recent news/evidence supporting the NO outcome "
+                    "or showing the event is unlikely. Specific terms, not verbatim question."
+                ),
+            },
+            "resolution": {
+                "type": "string",
+                "description": (
+                    "Search query to find official announcements, decisions, or source "
+                    "clarifications about how/when this market resolves."
+                ),
+            },
+        },
+    },
+}
+
+
+def _generate_queries_template(
     question: str,
     resolution_source: str | None = None,
     description: str | None = None,
 ) -> list[tuple[str, str]]:
-    """Return exactly 3 (query_string, label) pairs.
-
-    Each label maps to a purpose:
-      yes_case   — evidence for YES
-      no_case    — evidence for NO / counter-case
-      resolution — who resolves, official source, deadline
-    """
+    """Fallback: simple template-based queries when no API key is available."""
     base = question.rstrip("?").strip()
     res_hint = f" site:{resolution_source}" if resolution_source else ""
-
-    yes_query = f"{base} evidence likely happening"
-    no_query  = f"{base} evidence unlikely won't happen"
-    res_query = f"{base} official decision announcement{res_hint}"
-
     return [
-        (yes_query, "yes_case"),
-        (no_query,  "no_case"),
-        (res_query, "resolution"),
+        (f"{base} latest news 2025 2026", "yes_case"),
+        (f"{base} unlikely obstacles analysis", "no_case"),
+        (f"{base} official announcement{res_hint}", "resolution"),
     ]
+
+
+async def _generate_queries_llm(
+    question: str,
+    description: str | None,
+    resolution_source: str | None,
+    model: str,
+    api_key: str,
+) -> list[tuple[str, str]]:
+    """Use Claude to generate targeted, specific search queries for a market.
+
+    Falls back to template queries on any failure.
+    """
+    import anthropic
+
+    desc_line = f"\nDescription: {description[:400]}" if description else ""
+    res_line  = f"\nResolution source: {resolution_source}" if resolution_source else ""
+
+    prompt = (
+        f"You are a prediction market researcher. Generate targeted web search queries.\n\n"
+        f"Market question: {question}{desc_line}{res_line}\n\n"
+        "Rules:\n"
+        "- Use specific, newsworthy keywords (e.g. 'China PLA Taiwan strait military 2025')\n"
+        "- Do NOT repeat the market question verbatim\n"
+        "- Focus on recent events (past 3-6 months)\n"
+        "- yes_case: evidence the event WILL happen\n"
+        "- no_case: evidence the event WON'T happen or obstacles\n"
+        "- resolution: official source, announcement, or deadline clarification"
+    )
+
+    loop = asyncio.get_event_loop()
+    client = anthropic.Anthropic(api_key=api_key)
+
+    try:
+        response = await loop.run_in_executor(
+            None,
+            lambda: client.messages.create(
+                model=model,
+                max_tokens=300,
+                temperature=0,
+                tools=[_QUERY_GEN_TOOL],
+                tool_choice={"type": "tool", "name": "generate_search_queries"},
+                messages=[{"role": "user", "content": prompt}],
+            ),
+        )
+        for block in response.content:
+            if block.type == "tool_use" and block.name == "generate_search_queries":
+                q = block.input
+                return [
+                    (q["yes_case"],   "yes_case"),
+                    (q["no_case"],    "no_case"),
+                    (q["resolution"], "resolution"),
+                ]
+    except Exception as exc:
+        logger.warning("LLM query generation failed, using template fallback: %s", exc)
+
+    return _generate_queries_template(question, resolution_source, description)
 
 
 # ── Quote validation ──────────────────────────────────────────────────────────
@@ -241,7 +321,15 @@ async def evidence_retriever_node(state: dict) -> dict:
     description     = snapshot.get("description")
     resolution_src  = snapshot.get("resolution_source")
 
-    queries = _generate_queries(question, resolution_src, description)
+    # ── Generate queries: LLM if key available, template fallback otherwise ──
+    if settings.anthropic_api_key:
+        await push_log(run_id, "Generating search queries via Claude...", "info")
+        queries = await _generate_queries_llm(
+            question, description, resolution_src,
+            settings.claude_model_fast, settings.anthropic_api_key,
+        )
+    else:
+        queries = _generate_queries_template(question, resolution_src, description)
 
     await push_log(run_id, "Dispatching 3 Tavily search queries...", "info")
 
