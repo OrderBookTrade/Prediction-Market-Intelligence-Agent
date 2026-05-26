@@ -87,6 +87,7 @@ _QUERY_GEN_TOOL: dict = {
                 "type": "string",
                 "description": (
                     "Search query to find recent news/evidence supporting the NO outcome "
+                    "⚠ ANTHROPIC_API_KEY invalid shape — expected sk- prefix "
                     "or showing the event is unlikely. Specific terms, not verbatim question."
                 ),
             },
@@ -331,7 +332,7 @@ async def evidence_retriever_node(state: dict) -> dict:
     description     = snapshot.get("description")
     resolution_src  = snapshot.get("resolution_source")
 
-    anthropic_info = safe_secret_info(settings.anthropic_api_key, expected_prefix="sk-ant-")
+    anthropic_info = safe_secret_info(settings.anthropic_api_key, expected_prefix="sk-")
 
     # ── Generate queries: LLM if key appears usable, template fallback otherwise ──
     if anthropic_info["present"] and anthropic_info["prefix_ok"]:

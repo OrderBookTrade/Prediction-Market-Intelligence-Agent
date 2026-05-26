@@ -171,6 +171,7 @@ def _fallback_memo(
     search_queries: list = None,
     *,
     reason: str = "ANALYSIS_FAILED",
+    sources_found: int = 0,
 ) -> dict:
     yes_price = snapshot.get("yes_price", 0.5) or 0.5
     queries = [q.get("query", "") for q in (search_queries or [])]
@@ -203,7 +204,7 @@ def _fallback_memo(
         "model_name": "fallback",
         "prompt_version": PROMPT_VERSION,
         "search_queries": queries,
-        "sources_found": 0,
+        "sources_found": sources_found,
     }
 
 
@@ -222,7 +223,7 @@ async def memo_writer_node(state: dict) -> dict:
 
     if not search_results:
         await push_log(run_id, "No verified evidence found — skipping thesis generation", "warn")
-        memo = _fallback_memo(snapshot, run_id, search_queries, reason="NO_VERIFIED_EVIDENCE")
+        memo = _fallback_memo(snapshot, run_id, search_queries, reason="NO_VERIFIED_EVIDENCE", sources_found=0)
         _finalize(state, memo, run_id, condition_id, yes_price, search_queries, sources, 0)
         await push_log(run_id, "Agent probability = N/A · market price only shown · edge = N/A", "warn")
         await push_log(run_id, "Recommendation = NO_TRADE · fallback_reason=NO_VERIFIED_EVIDENCE", "warn")
@@ -236,11 +237,17 @@ async def memo_writer_node(state: dict) -> dict:
     await push_log(run_id, "Computing agent probability estimate...", "info")
     await push_log(run_id, f"Writing research memo... (schema={PROMPT_VERSION})", "info")
 
-    key_info = safe_secret_info(settings.anthropic_api_key, expected_prefix="sk-ant-")
+    key_info = safe_secret_info(settings.anthropic_api_key, expected_prefix="sk-")
 
     if not key_info["present"]:
         await push_log(run_id, "  ⚠ ANTHROPIC_API_KEY not set — using fallback memo", "warn")
-        memo = _fallback_memo(snapshot, run_id, search_queries, reason="ANTHROPIC_API_KEY_MISSING")
+        memo = _fallback_memo(
+            snapshot,
+            run_id,
+            search_queries,
+            reason="ANTHROPIC_API_KEY_MISSING",
+            sources_found=len(search_results),
+        )
         _finalize(state, memo, run_id, condition_id, yes_price, search_queries, sources, len(search_results))
         await push_log(run_id, "Agent probability = N/A · market price only shown · edge = N/A", "warn")
         return {"memo": memo}
@@ -249,12 +256,18 @@ async def memo_writer_node(state: dict) -> dict:
         await push_log(
             run_id,
             (
-                "  ⚠ ANTHROPIC_API_KEY invalid shape — expected sk-ant- prefix "
+                "  ⚠ ANTHROPIC_API_KEY invalid shape — expected sk- prefix "
                 f"(prefix={key_info['prefix']} length={key_info['length']} fingerprint={key_info['fingerprint']})"
             ),
             "error",
         )
-        memo = _fallback_memo(snapshot, run_id, search_queries, reason="ANTHROPIC_API_KEY_INVALID_SHAPE")
+        memo = _fallback_memo(
+            snapshot,
+            run_id,
+            search_queries,
+            reason="ANTHROPIC_API_KEY_INVALID_SHAPE",
+            sources_found=len(search_results),
+        )
         _finalize(state, memo, run_id, condition_id, yes_price, search_queries, sources, len(search_results))
         await push_log(run_id, "Agent probability = N/A · market price only shown · edge = N/A", "warn")
         return {"memo": memo}
@@ -316,7 +329,13 @@ async def memo_writer_node(state: dict) -> dict:
 
     if not memo_raw:
         await push_log(run_id, "  ✗ Memo generation failed — using fallback", "warn")
-        memo = _fallback_memo(snapshot, run_id, search_queries, reason="LLM_GENERATION_FAILED")
+        memo = _fallback_memo(
+            snapshot,
+            run_id,
+            search_queries,
+            reason="LLM_GENERATION_FAILED",
+            sources_found=len(search_results),
+        )
     else:
         edge = round(memo_raw.get("agent_estimate", yes_price) - yes_price, 4)
         memo = {

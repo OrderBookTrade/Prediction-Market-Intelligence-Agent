@@ -20,7 +20,7 @@ async def debug_anthropic(
     """Return safe Anthropic config metadata and, optionally, live auth status."""
     key = settings.anthropic_api_key
     out: dict = {
-        "api_key": safe_secret_info(key, expected_prefix="sk-ant-"),
+        "api_key": safe_secret_info(key, expected_prefix="sk-"),
         "model": settings.claude_model,
         "fast_model": settings.claude_model_fast,
         "probe": {"request_sent": False},
