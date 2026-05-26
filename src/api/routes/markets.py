@@ -88,6 +88,8 @@ def _raw_to_response(snap, history: list[float], change_24h: float | None) -> Ma
     flags = _compute_risk_flags(
         snap.yes_price, snap.liquidity, snap.spread, end_iso, snap.volume
     )
+    if change_24h is None and len(history) >= 2:
+        change_24h = round(history[-1] - history[-2], 4)
     return MarketResponse(
         condition_id=snap.condition_id,
         question=snap.question,
