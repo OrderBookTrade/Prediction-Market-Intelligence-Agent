@@ -305,6 +305,7 @@ async def resolve_url(body: ResolveRequest) -> ResolveResponse:
 
         event_title: str = event.get("title") or slug
         raw_markets: list[dict] = event.get("markets", [])
+        event_tags = event.get("tags", [])
 
         if not raw_markets:
             raise HTTPException(status_code=404, detail="Event has no markets")
@@ -314,6 +315,10 @@ async def resolve_url(body: ResolveRequest) -> ResolveResponse:
         responses: list[MarketResponse] = []
         for item in raw_markets:
             try:
+                # Inherit tags from event if market is missing them
+                if event_tags and not item.get("tags"):
+                    item["tags"] = event_tags
+                    
                 raw = MarketRaw.model_validate(item)
                 snap = normalize(raw)
 
