@@ -164,7 +164,7 @@ Generate a complete research memo using the write_research_memo tool.
 """
 
 
-def _fallback_memo(snapshot: dict, run_id: str) -> dict:
+def _fallback_memo(snapshot: dict, run_id: str, search_queries: list = [], sources_found: int = 0) -> dict:
     yes_price = snapshot.get("yes_price", 0.5) or 0.5
     return {
         "run_id": run_id,
@@ -174,8 +174,8 @@ def _fallback_memo(snapshot: dict, run_id: str) -> dict:
         "agent_estimate": yes_price,
         "edge": 0.0,
         "confidence": "uncertain",
-        "yes_case": [{"claim": "Insufficient evidence to support YES case.", "source": "none", "credibility": "LOW"}],
-        "no_case": [{"claim": "Insufficient evidence to support NO case.", "source": "none", "credibility": "LOW"}],
+        "yes_case": [],
+        "no_case": [],
         "resolution_source": snapshot.get("resolution_source") or "not specified",
         "resolution_deadline": snapshot.get("end_date") or "unknown",
         "resolution_condition": "See market description",
@@ -189,8 +189,8 @@ def _fallback_memo(snapshot: dict, run_id: str) -> dict:
         "key_uncertainties": ["Analysis failed — rerun with valid API keys"],
         "model_name": "fallback",
         "prompt_version": PROMPT_VERSION,
-        "search_queries": [],
-        "sources_found": 0,
+        "search_queries": search_queries,
+        "sources_found": sources_found,
     }
 
 
@@ -214,7 +214,7 @@ async def memo_writer_node(state: dict) -> dict:
 
     if not settings.anthropic_api_key:
         await push_log(run_id, "  ⚠ ANTHROPIC_API_KEY not set — using fallback memo", "warn")
-        memo = _fallback_memo(snapshot, run_id)
+        memo = _fallback_memo(snapshot, run_id, [q.get("query", "") for q in search_queries], len(search_results))
         _finalize(state, memo, run_id, condition_id, yes_price, search_queries, sources, len(search_results))
         return {"memo": memo}
 
@@ -257,7 +257,7 @@ async def memo_writer_node(state: dict) -> dict:
 
     if not memo_raw:
         await push_log(run_id, "  ✗ Memo generation failed — using fallback", "warn")
-        memo = _fallback_memo(snapshot, run_id)
+        memo = _fallback_memo(snapshot, run_id, [q.get("query", "") for q in search_queries], len(search_results))
     else:
         edge = round(memo_raw.get("agent_estimate", yes_price) - yes_price, 4)
         memo = {
