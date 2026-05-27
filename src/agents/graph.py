@@ -9,6 +9,7 @@ from langgraph.graph import END, StateGraph
 
 from src.agents.evidence_retriever import evidence_retriever_node
 from src.agents.market_analyzer import market_analyzer_node
+from src.agents.metrics import default_run_metrics
 from src.agents.memo_writer import memo_writer_node
 from src.agents.risk_critic import risk_critic_node
 
@@ -26,6 +27,7 @@ class AgentState(TypedDict):
     search_queries: list[Any]
     sources: list[Any]
     cited_evidence: list[Any]    # list[CitedEvidence.model_dump()] from evidence_retriever
+    run_metrics: dict[str, Any]
     risk_flags: list[str]
     risk_details: dict[str, Any]
     memo: dict | None
@@ -66,6 +68,7 @@ async def run_analysis(condition_id: str, run_id: str) -> dict:
         "search_queries": [],
         "sources": [],
         "cited_evidence": [],
+        "run_metrics": default_run_metrics(),
         "risk_flags": [],
         "risk_details": {},
         "memo": None,

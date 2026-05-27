@@ -8,7 +8,7 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
@@ -58,8 +58,20 @@ def init_db(engine: Engine | None = None) -> Engine:
     if engine is None:
         engine = get_engine()
     Base.metadata.create_all(engine)
+    _ensure_agent_runs_metrics_column(engine)
     logger.info("Database tables ready (%s)", engine.url.render_as_string(hide_password=True))
     return engine
+
+
+def _ensure_agent_runs_metrics_column(engine: Engine) -> None:
+    """Add metrics_json for existing local SQLite DBs created before run metrics."""
+    if engine.dialect.name != "sqlite":
+        return
+    with engine.begin() as conn:
+        rows = conn.execute(text("PRAGMA table_info(agent_runs)")).fetchall()
+        columns = {row[1] for row in rows}
+        if rows and "metrics_json" not in columns:
+            conn.execute(text("ALTER TABLE agent_runs ADD COLUMN metrics_json TEXT"))
 
 
 # ── Market snapshots ──────────────────────────────────────────────────────────
@@ -136,6 +148,13 @@ def update_run_status(
             run.error_message = error_message
         if status in ("done", "error"):
             run.finished_at = datetime.now(timezone.utc)
+        session.commit()
+
+
+def update_run_metrics(session: Session, run_id: str, metrics: dict) -> None:
+    run = session.get(AgentRunORM, run_id)
+    if run:
+        run.metrics_json = json.dumps(metrics)
         session.commit()
 
 
