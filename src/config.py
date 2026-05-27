@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     )
 
     anthropic_api_key: str = ""
+    deepseek_api_key: str = ""
     tavily_api_key: str = ""
     database_url: str = "sqlite:///./data/markets.db"
     log_level: str = "INFO"
@@ -19,6 +20,7 @@ class Settings(BaseSettings):
     # LLM settings
     claude_model: str = "claude-opus-4-5"
     claude_model_fast: str = "claude-sonnet-4-5"  # cheaper, for extraction tasks
+    deepseek_model: str = "deepseek-chat"
 
     # API server
     api_host: str = "0.0.0.0"
