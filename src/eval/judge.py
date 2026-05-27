@@ -155,19 +155,33 @@ async def _call_judge_llm(
     prompt: str,
     model: str,
     api_key: str,
+    provider: str = "anthropic",
 ) -> dict[str, Any]:
     """Standalone coroutine — monkeypatch this in tests."""
-    import anthropic
-
-    client = anthropic.AsyncAnthropic(api_key=api_key)
-    msg = await client.messages.create(
-        model=model,
-        max_tokens=1024,
-        temperature=0,
-        system=_JUDGE_SYSTEM,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text = msg.content[0].text.strip()
+    if provider == "deepseek":
+        import openai
+        client = openai.AsyncOpenAI(api_key=api_key, base_url="https://api.deepseek.com/v1")
+        msg = await client.chat.completions.create(
+            model=model,
+            max_tokens=1024,
+            temperature=0.0,
+            messages=[
+                {"role": "system", "content": _JUDGE_SYSTEM},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        text = msg.choices[0].message.content.strip()
+    else:
+        import anthropic
+        client = anthropic.AsyncAnthropic(api_key=api_key)
+        msg = await client.messages.create(
+            model=model,
+            max_tokens=1024,
+            temperature=0,
+            system=_JUDGE_SYSTEM,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = msg.content[0].text.strip()
 
     # Strip markdown code fences if present
     if text.startswith("```"):
@@ -201,8 +215,21 @@ async def grade_memo(
         MemoGrade with all scores populated.
     """
     from src.config import settings
+    from src.utils.secrets import safe_secret_info
 
-    key = api_key or settings.anthropic_api_key
+    anthropic_info = safe_secret_info(settings.anthropic_api_key, expected_prefix="sk-")
+    deepseek_info = safe_secret_info(settings.deepseek_api_key, expected_prefix="sk-")
+
+    use_deepseek = deepseek_info["present"]
+
+    if use_deepseek:
+        key = api_key or settings.deepseek_api_key
+        model_to_use = settings.deepseek_model
+        provider = "deepseek"
+    else:
+        key = api_key or settings.anthropic_api_key
+        model_to_use = model
+        provider = "anthropic"
 
     # ── Structural score — no LLM needed ──────────────────────────────────────
     agent_est = float(memo_dict.get("agent_estimate", 0.5))
@@ -243,7 +270,7 @@ async def grade_memo(
 
     # ── LLM call ──────────────────────────────────────────────────────────────
     try:
-        raw = await _call_judge_llm(prompt, model, key)
+        raw = await _call_judge_llm(prompt, model_to_use, key, provider)
     except Exception as exc:
         logger.warning("Judge LLM call failed: %s — using fallback scores", exc)
         raw = {
@@ -263,5 +290,5 @@ async def grade_memo(
         hedge_score=float(raw.get("hedge_score", 5)),
         overall=float(raw.get("overall", 5)),
         feedback=raw.get("feedback", []),
-        model_name=model,
+        model_name=model_to_use,
     )

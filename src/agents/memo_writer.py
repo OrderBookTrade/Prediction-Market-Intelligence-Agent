@@ -237,57 +237,25 @@ async def memo_writer_node(state: dict) -> dict:
     await push_log(run_id, "Computing agent probability estimate...", "info")
     await push_log(run_id, f"Writing research memo... (schema={PROMPT_VERSION})", "info")
 
-    key_info = safe_secret_info(settings.anthropic_api_key, expected_prefix="sk-")
+    anthropic_info = safe_secret_info(settings.anthropic_api_key, expected_prefix="sk-")
+    deepseek_info = safe_secret_info(settings.deepseek_api_key, expected_prefix="sk-")
 
-    if not key_info["present"]:
-        await push_log(run_id, "  ⚠ ANTHROPIC_API_KEY not set — using fallback memo", "warn")
+    use_deepseek = deepseek_info["present"]
+    use_anthropic = not use_deepseek and anthropic_info["present"] and anthropic_info["prefix_ok"]
+
+    if not use_deepseek and not use_anthropic:
+        await push_log(run_id, "  ⚠ No valid LLM API key set — using fallback memo", "warn")
         memo = _fallback_memo(
             snapshot,
             run_id,
             search_queries,
-            reason="ANTHROPIC_API_KEY_MISSING",
+            reason="LLM_API_KEY_MISSING",
             sources_found=len(search_results),
         )
         _finalize(state, memo, run_id, condition_id, yes_price, search_queries, sources, len(search_results))
         await push_log(run_id, "Agent probability = N/A · market price only shown · edge = N/A", "warn")
         return {"memo": memo}
 
-    if not key_info["prefix_ok"]:
-        await push_log(
-            run_id,
-            (
-                "  ⚠ ANTHROPIC_API_KEY invalid shape — expected sk- prefix "
-                f"(prefix={key_info['prefix']} length={key_info['length']} fingerprint={key_info['fingerprint']})"
-            ),
-            "error",
-        )
-        memo = _fallback_memo(
-            snapshot,
-            run_id,
-            search_queries,
-            reason="ANTHROPIC_API_KEY_INVALID_SHAPE",
-            sources_found=len(search_results),
-        )
-        _finalize(state, memo, run_id, condition_id, yes_price, search_queries, sources, len(search_results))
-        await push_log(run_id, "Agent probability = N/A · market price only shown · edge = N/A", "warn")
-        return {"memo": memo}
-
-    import anthropic
-
-    await push_log(
-        run_id,
-        (
-            "[anthropic] caller=memo_generator "
-            f"key_present={key_info['present']} "
-            f"key_prefix={key_info['prefix']} "
-            f"key_length={key_info['length']} "
-            f"fingerprint={key_info['fingerprint']} "
-            f"model={settings.claude_model}"
-        ),
-        "dim",
-    )
-
-    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
     prompt = _build_prompt(snapshot, search_results, risk_details, sources)
     input_hash = hashlib.sha256(prompt.encode()).hexdigest()[:16]
 
@@ -295,35 +263,79 @@ async def memo_writer_node(state: dict) -> dict:
     t0 = time.monotonic()
     token_input = token_output = 0
 
-    for attempt in range(2):
-        try:
-            response = client.messages.create(
-                model=settings.claude_model,
-                max_tokens=4096,
-                temperature=0.3,
-                tools=[MEMO_TOOL],
-                tool_choice={"type": "tool", "name": "write_research_memo"},
-                messages=[{"role": "user", "content": prompt}],
-            )
-            token_input = response.usage.input_tokens
-            token_output = response.usage.output_tokens
-
-            tool_block = next(
-                (b for b in response.content if b.type == "tool_use"),
-                None,
-            )
-            if tool_block:
-                memo_raw = tool_block.input
-                break
-        except Exception as exc:
-            if "AuthenticationError" in str(type(exc)) or "401" in str(exc):
-                logger.warning("Claude AuthenticationError: %s", exc)
+    if use_deepseek:
+        import openai
+        import json
+        await push_log(run_id, f"[deepseek] caller=memo_generator model={settings.deepseek_model}", "dim")
+        client = openai.OpenAI(api_key=settings.deepseek_api_key, base_url="https://api.deepseek.com/v1")
+        
+        tool = {
+            "type": "function",
+            "function": {
+                "name": MEMO_TOOL["name"],
+                "description": MEMO_TOOL["description"],
+                "parameters": MEMO_TOOL["input_schema"]
+            }
+        }
+        for attempt in range(2):
+            try:
+                response = client.chat.completions.create(
+                    model=settings.deepseek_model,
+                    max_tokens=4096,
+                    temperature=0.3,
+                    tools=[tool],
+                    tool_choice={"type": "function", "function": {"name": "write_research_memo"}},
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                if response.usage:
+                    token_input = response.usage.prompt_tokens
+                    token_output = response.usage.completion_tokens
+                if response.choices[0].message.tool_calls:
+                    memo_raw = json.loads(response.choices[0].message.tool_calls[0].function.arguments)
+                    break
+            except Exception as exc:
+                if "AuthenticationError" in str(type(exc)) or "401" in str(exc):
+                    logger.warning("DeepSeek AuthenticationError: %s", exc)
+                    if attempt == 0:
+                        await push_log(run_id, "  ⚠ DEEPSEEK_API_KEY invalid or unauthorized", "error")
+                    break
+                logger.warning("DeepSeek call attempt %d failed: %s", attempt + 1, exc)
                 if attempt == 0:
-                    await push_log(run_id, "  ⚠ ANTHROPIC_API_KEY invalid or unauthorized", "error")
-                break
-            logger.warning("Claude call attempt %d failed: %s", attempt + 1, exc)
-            if attempt == 0:
-                await push_log(run_id, f"  ⚠ retry after error: {exc}", "warn")
+                    await push_log(run_id, f"  ⚠ retry after error: {exc}", "warn")
+    else:
+        import anthropic
+        await push_log(run_id, f"[anthropic] caller=memo_generator model={settings.claude_model}", "dim")
+        client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        
+        for attempt in range(2):
+            try:
+                response = client.messages.create(
+                    model=settings.claude_model,
+                    max_tokens=4096,
+                    temperature=0.3,
+                    tools=[MEMO_TOOL],
+                    tool_choice={"type": "tool", "name": "write_research_memo"},
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                token_input = response.usage.input_tokens
+                token_output = response.usage.output_tokens
+
+                tool_block = next(
+                    (b for b in response.content if b.type == "tool_use"),
+                    None,
+                )
+                if tool_block:
+                    memo_raw = tool_block.input
+                    break
+            except Exception as exc:
+                if "AuthenticationError" in str(type(exc)) or "401" in str(exc):
+                    logger.warning("Claude AuthenticationError: %s", exc)
+                    if attempt == 0:
+                        await push_log(run_id, "  ⚠ ANTHROPIC_API_KEY invalid or unauthorized", "error")
+                    break
+                logger.warning("Claude call attempt %d failed: %s", attempt + 1, exc)
+                if attempt == 0:
+                    await push_log(run_id, f"  ⚠ retry after error: {exc}", "warn")
 
     latency_ms = int((time.monotonic() - t0) * 1000)
 

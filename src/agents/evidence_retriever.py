@@ -15,14 +15,108 @@ is emitted.  Under no circumstances should a hallucinated quote survive.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import re
+import time
 from typing import Any
 
+from src.agents.metrics import count_support, metrics_for, set_latency
 from src.run_store import push_log
-from src.schemas import CitedEvidence
+from src.schemas import CitedEvidence, EvidenceSide, EvidenceSupportLevel, SourceObject
 from src.utils.secrets import safe_secret_info
 
 logger = logging.getLogger(__name__)
+
+
+def _source_id_for(url: str) -> str:
+    """Deterministic short id for a source URL.
+
+    CitedEvidence.source_id is required; SearchHit carries no id, so we derive
+    a stable one from the URL (same URL -> same id, enabling dedup/linking).
+    """
+    return "src_" + hashlib.sha1((url or "").encode("utf-8")).hexdigest()[:12]
+
+
+def _side_for_label(label: str) -> EvidenceSide:
+    if label == "yes_case":
+        return EvidenceSide.YES
+    if label == "no_case":
+        return EvidenceSide.NO
+    return EvidenceSide.RESOLUTION
+
+
+def _clean_market_topic(question: str) -> str:
+    """Turn market-question phrasing into a natural search topic."""
+    text = question.strip().rstrip("?")
+    text = re.sub(r"^\s*will\s+", "", text, flags=re.I)
+    text = re.sub(r"\b(resolve|resolves|resolved)\s+to\s+(yes|no)\b", "", text, flags=re.I)
+    text = re.sub(r"\bby\s+[A-Z][a-z]+\s+\d{1,2},\s+\d{4}\b", "", text)
+    text = re.sub(r"\bby\s+\d{1,2}/\d{1,2}/\d{2,4}\b", "", text)
+    text = re.sub(r"\bbefore\s+[A-Z][a-z]+\s+\d{4}\b", "", text)
+    text = re.sub(r"\bbefore\s+\d{4}\b", "", text, flags=re.I)
+    text = re.sub(r"\bby\s+the\s+end\s+of\s+\d{4}\b", "", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text.replace(" x ", " ")).strip(" -:;,.")
+    return text or question.strip().rstrip("?")
+
+
+def _normalize_query(query: str, fallback_topic: str) -> str:
+    query = re.sub(r"^\s*will\s+", "", query.strip().rstrip("?"), flags=re.I)
+    query = re.sub(r"\bby\s+[A-Z][a-z]+\s+\d{1,2},\s+\d{4}\b", "", query)
+    query = re.sub(r"\s+", " ", query).strip(" -:;,.")
+    if len(query) < 40:
+        query = f"{query or fallback_topic} latest news official sources 2026"
+    if len(query) > 120:
+        query = query[:120].rsplit(" ", 1)[0]
+    return query
+
+
+def _source_from_hit(hit: Any) -> SourceObject | None:
+    url = getattr(hit, "url", "") or ""
+    snippet = getattr(hit, "snippet", "") or ""
+    title = getattr(hit, "title", "") or ""
+    if not url or not (snippet or title):
+        return None
+    return SourceObject(
+        source_id=_source_id_for(url),
+        url=url,
+        domain=getattr(hit, "publisher", "") or url,
+        title=title,
+        snippet=snippet,
+        raw_content=getattr(hit, "raw_text", None),
+        query_id=getattr(hit, "query_idx", 0) or 0,
+        query_label=getattr(hit, "query_label", "") or "",
+        credibility=getattr(hit, "credibility", "LOW") or "LOW",
+    )
+
+
+def _evidence_from_source(
+    source: SourceObject,
+    *,
+    claim: str | None = None,
+    quote: str | None = None,
+    label: str | None = None,
+    support_level: EvidenceSupportLevel = EvidenceSupportLevel.SNIPPET_SUPPORTED,
+    confidence: str = "low",
+) -> CitedEvidence | None:
+    supported_text = (quote or source.snippet or source.title).strip()
+    claim_text = (claim or source.title or source.snippet[:180]).strip()
+    if not source.url or not source.domain or not supported_text or not claim_text:
+        return None
+    evidence_label = label or source.query_label
+    return CitedEvidence(
+        source_id=source.source_id,
+        claim=claim_text,
+        quote=supported_text[:500],
+        source_url=source.url,
+        publisher=source.domain,
+        published_at=None,
+        credibility=source.credibility,
+        label=evidence_label,
+        side=_side_for_label(evidence_label),
+        support_level=support_level,
+        confidence=confidence,
+    )
 
 # ── Extraction tool schema (no $ref — flat for Anthropic API) ─────────────────
 
@@ -87,7 +181,6 @@ _QUERY_GEN_TOOL: dict = {
                 "type": "string",
                 "description": (
                     "Search query to find recent news/evidence supporting the NO outcome "
-                    "⚠ ANTHROPIC_API_KEY invalid shape — expected sk- prefix "
                     "or showing the event is unlikely. Specific terms, not verbatim question."
                 ),
             },
@@ -109,12 +202,12 @@ def _generate_queries_template(
     description: str | None = None,
 ) -> list[tuple[str, str]]:
     """Fallback: simple template-based queries when no API key is available."""
-    base = question.rstrip("?").strip()
+    base = _clean_market_topic(question)
     res_hint = f" site:{resolution_source}" if resolution_source else ""
     return [
-        (f"{base} latest news 2025 2026", "yes_case"),
-        (f"{base} unlikely obstacles analysis", "no_case"),
-        (f"{base} official announcement{res_hint}", "resolution"),
+        (_normalize_query(f"{base} latest news evidence 2026", base), "yes_case"),
+        (_normalize_query(f"{base} obstacles unlikely analysis 2026", base), "no_case"),
+        (_normalize_query(f"{base} official announcement resolution source{res_hint}", base), "resolution"),
     ]
 
 
@@ -133,22 +226,25 @@ async def _generate_queries_llm(
     resolution_source: str | None,
     model: str,
     api_key: str,
+    provider: str = "anthropic",
 ) -> list[tuple[str, str]]:
     """Use Claude to generate targeted, specific search queries for a market.
 
     Falls back to template queries on any failure.
     """
-    import anthropic
-
     desc_line = f"\nDescription: {description[:400]}" if description else ""
     res_line  = f"\nResolution source: {resolution_source}" if resolution_source else ""
+    clean_topic = _clean_market_topic(question)
 
     prompt = (
         f"You are a prediction market researcher. Generate targeted web search queries.\n\n"
-        f"Market question: {question}{desc_line}{res_line}\n\n"
+        f"Market question: {question}\n"
+        f"Clean topic: {clean_topic}{desc_line}{res_line}\n\n"
         "Rules:\n"
         "- Use specific, newsworthy keywords (e.g. 'China PLA Taiwan strait military 2025')\n"
         "- Do NOT repeat the market question verbatim\n"
+        "- Remove 'Will', deadline phrasing, and prediction-market wording\n"
+        "- Each query must be 40-120 characters and must not be truncated\n"
         "- Focus on recent events (past 3-6 months)\n"
         "- yes_case: evidence the event WILL happen\n"
         "- no_case: evidence the event WON'T happen or obstacles\n"
@@ -156,28 +252,60 @@ async def _generate_queries_llm(
     )
 
     loop = asyncio.get_event_loop()
-    client = anthropic.Anthropic(api_key=api_key)
 
     try:
-        response = await loop.run_in_executor(
-            None,
-            lambda: client.messages.create(
-                model=model,
-                max_tokens=300,
-                temperature=0,
-                tools=[_QUERY_GEN_TOOL],
-                tool_choice={"type": "tool", "name": "generate_search_queries"},
-                messages=[{"role": "user", "content": prompt}],
-            ),
-        )
-        for block in response.content:
-            if block.type == "tool_use" and block.name == "generate_search_queries":
-                q = block.input
+        if provider == "deepseek":
+            import openai
+            import json
+            client = openai.OpenAI(api_key=api_key, base_url="https://api.deepseek.com/v1")
+            tool = {
+                "type": "function",
+                "function": {
+                    "name": _QUERY_GEN_TOOL["name"],
+                    "description": _QUERY_GEN_TOOL["description"],
+                    "parameters": _QUERY_GEN_TOOL["input_schema"]
+                }
+            }
+            response = await loop.run_in_executor(
+                None,
+                lambda: client.chat.completions.create(
+                    model=model,
+                    max_tokens=300,
+                    temperature=0.0,
+                    tools=[tool],
+                    tool_choice={"type": "function", "function": {"name": "generate_search_queries"}},
+                    messages=[{"role": "user", "content": prompt}],
+                ),
+            )
+            if response.choices[0].message.tool_calls:
+                q = json.loads(response.choices[0].message.tool_calls[0].function.arguments)
                 return [
-                    (q["yes_case"],   "yes_case"),
-                    (q["no_case"],    "no_case"),
-                    (q["resolution"], "resolution"),
+                    (_normalize_query(q.get("yes_case", ""), clean_topic), "yes_case"),
+                    (_normalize_query(q.get("no_case", ""), clean_topic), "no_case"),
+                    (_normalize_query(q.get("resolution", ""), clean_topic), "resolution"),
                 ]
+        else:
+            import anthropic
+            client = anthropic.Anthropic(api_key=api_key)
+            response = await loop.run_in_executor(
+                None,
+                lambda: client.messages.create(
+                    model=model,
+                    max_tokens=300,
+                    temperature=0,
+                    tools=[_QUERY_GEN_TOOL],
+                    tool_choice={"type": "tool", "name": "generate_search_queries"},
+                    messages=[{"role": "user", "content": prompt}],
+                ),
+            )
+            for block in response.content:
+                if block.type == "tool_use" and block.name == "generate_search_queries":
+                    q = block.input
+                    return [
+                        (_normalize_query(q["yes_case"], clean_topic), "yes_case"),
+                        (_normalize_query(q["no_case"], clean_topic), "no_case"),
+                        (_normalize_query(q["resolution"], clean_topic), "resolution"),
+                    ]
     except Exception as exc:
         logger.warning("LLM query generation failed, using template fallback: %s", exc)
 
@@ -205,15 +333,13 @@ async def _call_extraction_llm(
     question: str,
     model: str,
     api_key: str,
+    provider: str = "anthropic",
 ) -> dict | None:
     """Call Claude with tool_use to extract one evidence item from a search hit.
 
     Returns the raw tool-input dict, or None on any failure.
     This function is a standalone coroutine so tests can patch it easily.
     """
-    import anthropic
-
-    client = anthropic.Anthropic(api_key=api_key)
     prompt = (
         f"Market question: {question}\n\n"
         f"Source: {hit.title} ({hit.publisher})\n"
@@ -225,20 +351,48 @@ async def _call_extraction_llm(
 
     loop = asyncio.get_event_loop()
     try:
-        response = await loop.run_in_executor(
-            None,
-            lambda: client.messages.create(
-                model=model,
-                max_tokens=512,
-                temperature=0,
-                tools=[EXTRACTION_TOOL],
-                tool_choice={"type": "tool", "name": "extract_evidence"},
-                messages=[{"role": "user", "content": prompt}],
-            ),
-        )
-        for block in response.content:
-            if block.type == "tool_use" and block.name == "extract_evidence":
-                return block.input
+        if provider == "deepseek":
+            import openai
+            import json
+            client = openai.OpenAI(api_key=api_key, base_url="https://api.deepseek.com/v1")
+            tool = {
+                "type": "function",
+                "function": {
+                    "name": EXTRACTION_TOOL["name"],
+                    "description": EXTRACTION_TOOL["description"],
+                    "parameters": EXTRACTION_TOOL["input_schema"]
+                }
+            }
+            response = await loop.run_in_executor(
+                None,
+                lambda: client.chat.completions.create(
+                    model=model,
+                    max_tokens=512,
+                    temperature=0.0,
+                    tools=[tool],
+                    tool_choice={"type": "function", "function": {"name": "extract_evidence"}},
+                    messages=[{"role": "user", "content": prompt}],
+                ),
+            )
+            if response.choices[0].message.tool_calls:
+                return json.loads(response.choices[0].message.tool_calls[0].function.arguments)
+        else:
+            import anthropic
+            client = anthropic.Anthropic(api_key=api_key)
+            response = await loop.run_in_executor(
+                None,
+                lambda: client.messages.create(
+                    model=model,
+                    max_tokens=512,
+                    temperature=0,
+                    tools=[EXTRACTION_TOOL],
+                    tool_choice={"type": "tool", "name": "extract_evidence"},
+                    messages=[{"role": "user", "content": prompt}],
+                ),
+            )
+            for block in response.content:
+                if block.type == "tool_use" and block.name == "extract_evidence":
+                    return block.input
     except Exception as exc:
         logger.warning("Extraction LLM failed for %s: %s", hit.url, exc)
     return None
@@ -251,34 +405,59 @@ async def _extract_and_validate(
     question: str,
     model: str,
     api_key: str,
+    provider: str = "anthropic",
 ) -> CitedEvidence | None:
-    """Call extraction LLM then enforce quote substring rule.
+    """Call extraction LLM and return the strongest source-supported evidence.
 
-    Returns CitedEvidence or None (logged warning on rejection).
+    Exact quote matches become quote_verified evidence. If the model produces an
+    unsupported quote but the search hit has a real snippet, downgrade to
+    snippet_supported LOW confidence instead of dropping the source.
     """
-    data = await _call_extraction_llm(hit, question, model, api_key)
-    if data is None:
+    source = _source_from_hit(hit)
+    if source is None:
         return None
 
+    data = await _call_extraction_llm(hit, question, model, api_key, provider)
+    if data is None:
+        return _evidence_from_source(source)
+
     quote = data.get("quote", "")
-    if not _quote_valid(quote, hit.snippet):
+    label = data.get("label", hit.query_label or "")
+    if _quote_valid(quote, source.snippet):
+        support = (
+            EvidenceSupportLevel.PRIMARY_SOURCE_VERIFIED
+            if source.credibility == "HIGH"
+            else EvidenceSupportLevel.QUOTE_VERIFIED
+        )
+        return _evidence_from_source(
+            source,
+            claim=data.get("claim", ""),
+            quote=quote,
+            label=label,
+            support_level=support,
+            confidence=data.get("confidence", "medium"),
+        )
+
+    raw_content = source.raw_content or ""
+    if raw_content and _quote_valid(quote, raw_content):
+        return _evidence_from_source(
+            source,
+            claim=data.get("claim", ""),
+            quote=quote,
+            label=label,
+            support_level=EvidenceSupportLevel.RAW_CONTENT_SUPPORTED,
+            confidence="low",
+        )
+
+    if source.snippet:
         logger.warning(
-            "Quote validation FAILED for %s — dropping. quote=%r",
+            "Quote validation failed for %s — downgrading to snippet_supported. quote=%r",
             hit.url,
             quote[:80],
         )
-        return None
+        return _evidence_from_source(source, label=label)
 
-    return CitedEvidence(
-        claim=data.get("claim", ""),
-        quote=quote,
-        source_url=hit.url,
-        publisher=hit.publisher,
-        published_at=hit.published_at,
-        credibility=hit.credibility,
-        label=data.get("label", hit.query_label or ""),
-        confidence=data.get("confidence", "low"),
-    )
+    return None
 
 
 # ── Deduplication ─────────────────────────────────────────────────────────────
@@ -305,17 +484,13 @@ def _fallback_evidence(hit: Any) -> CitedEvidence:
     Uses the title as the claim and the first 100 chars of the snippet as the
     quote — both are guaranteed to be valid substrings.
     """
-    safe_quote = hit.snippet[:100] if hit.snippet else hit.title[:100]
-    return CitedEvidence(
-        claim=hit.title,
-        quote=safe_quote,
-        source_url=hit.url,
-        publisher=hit.publisher,
-        published_at=hit.published_at,
-        credibility=hit.credibility,
-        label=hit.query_label or "",
-        confidence="low",
-    )
+    source = _source_from_hit(hit)
+    if source is None:
+        raise ValueError("Cannot build fallback evidence without source support")
+    evidence = _evidence_from_source(source)
+    if evidence is None:
+        raise ValueError("Cannot build fallback evidence without source support")
+    return evidence
 
 
 # ── Main node ─────────────────────────────────────────────────────────────────
@@ -323,6 +498,8 @@ def _fallback_evidence(hit: Any) -> CitedEvidence:
 async def evidence_retriever_node(state: dict) -> dict:
     run_id: str = state["run_id"]
     snapshot: dict = state.get("snapshot") or {}
+    metrics = metrics_for(state)
+    stage_t0 = time.monotonic()
 
     from src.config import settings
     from src.retrieval.reranker import bm25_rerank
@@ -333,41 +510,34 @@ async def evidence_retriever_node(state: dict) -> dict:
     resolution_src  = snapshot.get("resolution_source")
 
     anthropic_info = safe_secret_info(settings.anthropic_api_key, expected_prefix="sk-")
+    deepseek_info = safe_secret_info(settings.deepseek_api_key, expected_prefix="sk-")
+
+    use_deepseek = deepseek_info["present"]
+    use_anthropic = not use_deepseek and anthropic_info["present"] and anthropic_info["prefix_ok"]
 
     # ── Generate queries: LLM if key appears usable, template fallback otherwise ──
-    if anthropic_info["present"] and anthropic_info["prefix_ok"]:
-        await push_log(run_id, "Generating search queries via Claude...", "info")
-        await push_log(
-            run_id,
-            (
-                "[anthropic] caller=query_planner "
-                f"key_present={anthropic_info['present']} "
-                f"key_prefix={anthropic_info['prefix']} "
-                f"key_length={anthropic_info['length']} "
-                f"fingerprint={anthropic_info['fingerprint']} "
-                f"model={settings.claude_model_fast}"
-            ),
-            "dim",
+    if use_deepseek:
+        await push_log(run_id, "Generating search queries via DeepSeek...", "info")
+        queries = await _generate_queries_llm(
+            question, description, resolution_src,
+            settings.deepseek_model, settings.deepseek_api_key,
+            provider="deepseek"
         )
+    elif use_anthropic:
+        await push_log(run_id, "Generating search queries via Claude...", "info")
         queries = await _generate_queries_llm(
             question, description, resolution_src,
             settings.claude_model_fast, settings.anthropic_api_key,
+            provider="anthropic"
         )
     else:
-        await push_log(
-            run_id,
-            (
-                "[anthropic] caller=query_planner skipped "
-                f"key_present={anthropic_info['present']} "
-                f"key_prefix={anthropic_info['prefix']} "
-                f"key_length={anthropic_info['length']} "
-                f"fingerprint={anthropic_info['fingerprint']}"
-            ),
-            "warn",
-        )
+        await push_log(run_id, "No valid LLM key found. Using template fallback queries.", "warn")
         queries = _generate_queries_template(question, resolution_src, description)
 
-    await push_log(run_id, "Dispatching 3 Tavily search queries...", "info")
+    metrics["planned_queries"] = [{"query": q, "label": label} for q, label in queries]
+    set_latency(metrics, "query_planner", stage_t0)
+
+    await push_log(run_id, f"Dispatching {len(queries)} Tavily search queries...", "info")
     key_info = safe_secret_info(settings.tavily_api_key, expected_prefix="tvl")
     await push_log(
         run_id,
@@ -389,9 +559,11 @@ async def evidence_retriever_node(state: dict) -> dict:
             "search_queries":  [],
             "sources":         [],
             "cited_evidence":  [],
+            "run_metrics": metrics,
         }
 
     client = TavilySearchClient(settings.tavily_api_key)
+    search_t0 = time.monotonic()
 
     # ── Fire queries concurrently ─────────────────────────────────────────────
     async def _run_query(idx: int, q: str, label: str):
@@ -416,29 +588,51 @@ async def evidence_retriever_node(state: dict) -> dict:
         all_hits.extend(hits)
         query_log.append({"idx": idx, "query": q, "label": label, "results": len(hits), "took_ms": took_ms})
 
+    metrics["search_requests_sent"] = len(query_log)
+    metrics["raw_hits"] = len(all_hits)
+    set_latency(metrics, "search", search_t0)
     await push_log(run_id, f"Search requests executed: {len(query_log)}/{len(queries)}", "info")
 
     await push_log(run_id, f"Retrieved {len(all_hits)} raw hits — reranking...", "info")
 
     # ── BM25 rerank and credibility filter ───────────────────────────────────
+    rerank_t0 = time.monotonic()
     reranked = bm25_rerank(all_hits, question, top_k=12)
     medium_plus = [h for h in reranked if h.credibility in ("HIGH", "MEDIUM")]
     top_hits = medium_plus[:8] if medium_plus else reranked[:8]
+    normalized_sources = [s for h in top_hits if (s := _source_from_hit(h)) is not None]
+    metrics["unique_sources"] = len({s.source_id for s in normalized_sources})
+    metrics["credible_sources"] = len([s for s in normalized_sources if s.credibility in ("HIGH", "MEDIUM")])
+    set_latency(metrics, "rerank", rerank_t0)
 
     await push_log(run_id, f"  ✓ {len(top_hits)} sources passed credibility filter", "ok")
 
     # ── Extract evidence (LLM or fallback) ───────────────────────────────────
+    extract_t0 = time.monotonic()
     raw_evidence: list[CitedEvidence] = []
 
-    if not anthropic_info["present"] or not anthropic_info["prefix_ok"]:
-        await push_log(run_id, "  ⚠ Anthropic unavailable — using title-based fallback evidence", "warn")
-        raw_evidence = [_fallback_evidence(h) for h in top_hits]
-    else:
-        await push_log(run_id, "Extracting claims from sources (claude-sonnet)...", "info")
+    if use_deepseek:
+        await push_log(run_id, "Extracting claims from sources (deepseek)...", "info")
         extraction_tasks = [
-            _extract_and_validate(h, question, settings.claude_model_fast, settings.anthropic_api_key)
+            _extract_and_validate(h, question, settings.deepseek_model, settings.deepseek_api_key, "deepseek")
             for h in top_hits
         ]
+    elif use_anthropic:
+        await push_log(run_id, "Extracting claims from sources (claude-sonnet)...", "info")
+        extraction_tasks = [
+            _extract_and_validate(h, question, settings.claude_model_fast, settings.anthropic_api_key, "anthropic")
+            for h in top_hits
+        ]
+    else:
+        await push_log(run_id, "  ⚠ LLM unavailable — using title-based fallback evidence", "warn")
+        raw_evidence = []
+        for h in top_hits:
+            try:
+                raw_evidence.append(_fallback_evidence(h))
+            except ValueError:
+                logger.warning("Evidence fallback skipped unsupported hit %s", getattr(h, "url", ""))
+
+    if use_deepseek or use_anthropic:
         results = await asyncio.gather(*extraction_tasks, return_exceptions=True)
 
         for h, res in zip(top_hits, results):
@@ -450,9 +644,14 @@ async def evidence_retriever_node(state: dict) -> dict:
                 logger.warning("Evidence dropped for %s (None result)", h.url)
 
         await push_log(run_id, f"  ✓ {len(raw_evidence)}/{len(top_hits)} items passed quote validation", "ok")
+    set_latency(metrics, "evidence_extraction", extract_t0)
 
     # ── Dedup by URL ──────────────────────────────────────────────────────────
     cited: list[CitedEvidence] = _dedup_by_url(raw_evidence)
+    for ev in cited:
+        count_support(metrics, ev.support_level.value if hasattr(ev.support_level, "value") else str(ev.support_level))
+    metrics["claims_generated"] = len(raw_evidence)
+    metrics["claims_published"] = len(cited)
 
     # ── Stream previews ───────────────────────────────────────────────────────
     await push_log(run_id, "Top evidence items:", "info")
@@ -467,6 +666,9 @@ async def evidence_retriever_node(state: dict) -> dict:
             "url":         ev.source_url,
             "content":     ev.quote,
             "credibility": ev.credibility,
+            "source_id":   ev.source_id,
+            "side":        ev.side.value if hasattr(ev.side, "value") else ev.side,
+            "support_level": ev.support_level.value if hasattr(ev.support_level, "value") else ev.support_level,
         }
         for ev in cited
     ]
@@ -479,6 +681,9 @@ async def evidence_retriever_node(state: dict) -> dict:
             "content": ev.quote,
             "cred":    ev.credibility,
             "label":   ev.label,
+            "source_id": ev.source_id,
+            "side": ev.side.value if hasattr(ev.side, "value") else ev.side,
+            "support_level": ev.support_level.value if hasattr(ev.support_level, "value") else ev.support_level,
             "conf":    ev.confidence,
         }
         for ev in cited
@@ -487,6 +692,8 @@ async def evidence_retriever_node(state: dict) -> dict:
     return {
         "search_results": search_results_compat,
         "search_queries": query_log,
+        "normalized_sources": [s.model_dump() for s in normalized_sources],
         "sources":        sources_out,
         "cited_evidence": [ev.model_dump() for ev in cited],
+        "run_metrics": metrics,
     }
