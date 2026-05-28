@@ -170,3 +170,31 @@ async def get_run_result(run_id: str) -> dict:
         }
 
     return result
+
+
+@router.get("/runs")
+async def list_runs(limit: int = 50, status: str | None = None) -> list[dict]:
+    """List recent agent runs from DB — used by RUNS page and EVAL grading flow."""
+    from src.storage.db import get_engine
+    from src.storage.models import AgentRunORM
+    from sqlalchemy.orm import Session
+
+    def _query():
+        with Session(get_engine()) as s:
+            q = s.query(AgentRunORM).order_by(AgentRunORM.started_at.desc())
+            if status:
+                q = q.filter(AgentRunORM.status == status)
+            rows = q.limit(limit).all()
+            return [
+                {
+                    "run_id":       r.run_id,
+                    "condition_id": r.condition_id,
+                    "status":       r.status,
+                    "started_at":   r.started_at.isoformat() if r.started_at else None,
+                    "finished_at":  r.finished_at.isoformat() if r.finished_at else None,
+                    "error_message": r.error_message,
+                }
+                for r in rows
+            ]
+
+    return await run_in_threadpool(_query)

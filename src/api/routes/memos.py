@@ -48,6 +48,7 @@ REC_MAP = {
 
 
 class MemoOut(BaseModel):
+    run_id: str | None = None          # exposed so frontend can trigger /eval/grade
     generated_at: str
     model: str
     prompt_version: str
@@ -63,6 +64,8 @@ class MemoOut(BaseModel):
     rationale: str
     search_queries: list[str]
     sources_found: int
+    token_input: int | None = None
+    token_output: int | None = None
 
 
 def _orm_to_memo_out(orm) -> MemoOut:
@@ -71,6 +74,7 @@ def _orm_to_memo_out(orm) -> MemoOut:
     rec_meta = REC_MAP.get(rec, {"label": rec.upper(), "tone": "gray"})
 
     return MemoOut(
+        run_id=orm.run_id,
         generated_at=orm.created_at.strftime("%Y-%m-%d %H:%M UTC"),
         model=orm.model_name,
         prompt_version=orm.prompt_version,
@@ -95,6 +99,8 @@ def _orm_to_memo_out(orm) -> MemoOut:
         rationale=data.get("recommendation_rationale", ""),
         search_queries=data.get("search_queries", []),
         sources_found=orm.sources_found,
+        token_input=data.get("token_input"),
+        token_output=data.get("token_output"),
     )
 
 
