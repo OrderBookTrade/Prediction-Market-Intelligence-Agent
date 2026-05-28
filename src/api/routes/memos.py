@@ -18,6 +18,7 @@ class EvidenceOut(BaseModel):
     claim: str
     source: str
     credibility: str
+    url: str | None = None
 
 
 class ResolutionOut(BaseModel):

@@ -349,6 +349,20 @@ async def memo_writer_node(state: dict) -> dict:
             sources_found=len(search_results),
         )
     else:
+        yes_case = memo_raw.get("yes_case", [])
+        no_case = memo_raw.get("no_case", [])
+        
+        # Enrich with URLs from retrieved sources
+        all_sources = search_results + (sources or [])
+        for ev in yes_case + no_case:
+            src = ev.get("source", "")
+            for s in all_sources:
+                domain = s.get("domain", "")
+                url = s.get("url", "")
+                if src and domain and (src.lower() == domain.lower() or src.lower() in url.lower() or domain.lower() in src.lower()):
+                    ev["url"] = url
+                    break
+
         edge = round(memo_raw.get("agent_estimate", yes_price) - yes_price, 4)
         memo = {
             "run_id": run_id,
@@ -358,8 +372,8 @@ async def memo_writer_node(state: dict) -> dict:
             "agent_estimate": memo_raw.get("agent_estimate", yes_price),
             "edge": edge,
             "confidence": memo_raw.get("confidence", "uncertain"),
-            "yes_case": memo_raw.get("yes_case", []),
-            "no_case": memo_raw.get("no_case", []),
+            "yes_case": yes_case,
+            "no_case": no_case,
             "resolution_source": memo_raw.get("resolution_source", ""),
             "resolution_deadline": memo_raw.get("resolution_deadline", ""),
             "resolution_condition": memo_raw.get("resolution_condition", ""),

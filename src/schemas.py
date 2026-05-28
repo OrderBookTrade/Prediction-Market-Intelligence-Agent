@@ -130,6 +130,7 @@ class EvidenceItem(BaseModel):
     source: str | None = None
     credibility: str | None = None
     source_id: str | None = None
+    url: str | None = None
     side: EvidenceSide | None = None
     support_level: EvidenceSupportLevel | None = None
 
