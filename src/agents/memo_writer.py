@@ -20,6 +20,13 @@ logger = logging.getLogger(__name__)
 
 PROMPT_VERSION = "v1"
 
+_SUPPORT_LEVELS = {
+    "snippet_supported",
+    "raw_content_supported",
+    "quote_verified",
+    "primary_source_verified",
+}
+
 # ── Tool schema (flat — no $ref) ──────────────────────────────────────────────
 
 MEMO_TOOL: dict = {
@@ -52,27 +59,37 @@ MEMO_TOOL: dict = {
             },
             "yes_case": {
                 "type": "array",
-                "description": "Evidence supporting YES outcome. Minimum 1 item.",
+                "description": "Evidence supporting YES outcome. Only use provided LABEL=yes_case evidence.",
                 "items": {
                     "type": "object",
-                    "required": ["claim", "source", "credibility"],
+                    "required": ["claim", "source", "credibility", "source_id", "support_level"],
                     "properties": {
                         "claim": {"type": "string", "description": "Specific, factual claim."},
                         "source": {"type": "string", "description": "Domain or URL of the source."},
                         "credibility": {"type": "string", "enum": ["HIGH", "MEDIUM", "LOW"]},
+                        "source_id": {"type": "string", "description": "Exact source_id from the evidence list."},
+                        "support_level": {
+                            "type": "string",
+                            "enum": ["snippet_supported", "raw_content_supported", "quote_verified", "primary_source_verified"],
+                        },
                     },
                 },
             },
             "no_case": {
                 "type": "array",
-                "description": "Evidence supporting NO outcome. Minimum 1 item.",
+                "description": "Evidence supporting NO outcome. Only use provided LABEL=no_case evidence.",
                 "items": {
                     "type": "object",
-                    "required": ["claim", "source", "credibility"],
+                    "required": ["claim", "source", "credibility", "source_id", "support_level"],
                     "properties": {
                         "claim": {"type": "string"},
                         "source": {"type": "string"},
                         "credibility": {"type": "string", "enum": ["HIGH", "MEDIUM", "LOW"]},
+                        "source_id": {"type": "string", "description": "Exact source_id from the evidence list."},
+                        "support_level": {
+                            "type": "string",
+                            "enum": ["snippet_supported", "raw_content_supported", "quote_verified", "primary_source_verified"],
+                        },
                     },
                 },
             },
@@ -115,6 +132,8 @@ def _build_prompt(
     if labeled_sources:
         evidence_text = "\n".join(
             f"[{i+1}] LABEL={s.get('label') or 'unknown'} CRED={s.get('cred') or '?'} "
+            f"SOURCE_ID={s.get('source_id') or '?'} "
+            f"SUPPORT={s.get('support_level') or '?'} "
             f"SOURCE={s.get('domain') or s.get('url')}\n"
             f"    CLAIM: {s.get('title', '')}\n"
             f"    QUOTE: {s.get('content', '')[:300]}"
@@ -122,7 +141,9 @@ def _build_prompt(
         )
     else:
         evidence_text = "\n".join(
-            f"[{i+1}] LABEL=unknown CRED={r.get('credibility') or '?'} SOURCE={r.get('url', '')}\n"
+            f"[{i+1}] LABEL=unknown CRED={r.get('credibility') or '?'} "
+            f"SOURCE_ID={r.get('source_id') or '?'} "
+            f"SUPPORT={r.get('support_level') or '?'} SOURCE={r.get('url', '')}\n"
             f"    CLAIM: {r.get('title', '')}\n"
             f"    QUOTE: {r.get('content', '')[:300]}"
             for i, r in enumerate(search_results[:8])
@@ -144,8 +165,8 @@ RULES:
 - Respect evidence labels: LABEL=yes_case supports YES, LABEL=no_case supports NO,
   and LABEL=resolution only clarifies rules/source/deadline. Do not put NO evidence
   into yes_case or YES evidence into no_case.
-- If one side has no labeled evidence, include one explicit insufficient-evidence item
-  for that side instead of borrowing evidence from the other side.
+- Every yes_case/no_case item must copy SOURCE_ID and SUPPORT exactly from the
+  evidence list. If one side has no labeled evidence, leave that case empty.
 
 MARKET:
 Question: {snapshot.get('question')}
@@ -162,7 +183,108 @@ EVIDENCE ({len(search_results)} sources retrieved):
 {evidence_text}
 
 Generate a complete research memo using the write_research_memo tool.
-"""
+    """
+
+
+def _source_side(source: dict) -> str:
+    side = source.get("side")
+    if side:
+        return str(side)
+    label = source.get("label") or source.get("query_label")
+    if label == "yes_case":
+        return "yes"
+    if label == "no_case":
+        return "no"
+    if label == "resolution":
+        return "resolution"
+    return ""
+
+
+def _source_domain(source: dict) -> str:
+    return str(source.get("domain") or source.get("publisher") or source.get("source") or "").lower()
+
+
+def _source_url(source: dict) -> str:
+    return str(source.get("url") or source.get("source_url") or "").lower()
+
+
+def _source_support_level(source: dict) -> str:
+    support = str(source.get("support_level") or "").strip()
+    return support if support in _SUPPORT_LEVELS else "snippet_supported"
+
+
+def _real_source_candidates(sources: list[dict], search_results: list[dict]) -> list[dict]:
+    candidates: list[dict] = []
+    seen: set[str] = set()
+    for source in [*(sources or []), *(search_results or [])]:
+        source_id = source.get("source_id")
+        url = source.get("url") or source.get("source_url")
+        domain = source.get("domain") or source.get("publisher")
+        if not source_id or not url:
+            continue
+        key = str(source_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(
+            {
+                **source,
+                "source_id": str(source_id),
+                "url": str(url),
+                "domain": str(domain or url),
+                "side": _source_side(source),
+                "support_level": _source_support_level(source),
+                "credibility": source.get("credibility") or source.get("cred") or "LOW",
+            }
+        )
+    return candidates
+
+
+def _match_source(item: dict, expected_side: str, candidates: list[dict]) -> dict | None:
+    wanted_source_id = str(item.get("source_id") or "").strip()
+    item_source = str(item.get("source") or item.get("url") or "").lower().strip()
+
+    for candidate in candidates:
+        if candidate["side"] != expected_side:
+            continue
+        if wanted_source_id and wanted_source_id == candidate["source_id"]:
+            return candidate
+
+    if not item_source:
+        return None
+
+    for candidate in candidates:
+        if candidate["side"] != expected_side:
+            continue
+        domain = _source_domain(candidate)
+        url = _source_url(candidate)
+        if item_source == domain or item_source in url or domain in item_source:
+            return candidate
+
+    return None
+
+
+def _enrich_case_items(items: list[dict], expected_side: str, candidates: list[dict]) -> list[dict]:
+    enriched: list[dict] = []
+    for item in items or []:
+        claim = str(item.get("claim") or "").strip()
+        if not claim:
+            continue
+        source = _match_source(item, expected_side, candidates)
+        if source is None:
+            logger.warning("Dropping memo claim without valid %s source: %s", expected_side, claim[:120])
+            continue
+        enriched.append(
+            {
+                "claim": claim,
+                "source": source["domain"],
+                "credibility": source["credibility"],
+                "source_id": source["source_id"],
+                "support_level": source["support_level"],
+                "url": source["url"],
+            }
+        )
+    return enriched
 
 
 def _fallback_memo(

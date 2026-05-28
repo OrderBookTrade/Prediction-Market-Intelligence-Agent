@@ -1,4 +1,4 @@
-"""GET /api/eval/summary  ·  GET /api/eval/history  ·  POST /api/eval/grade/{run_id}  ·  GET /api/eval/grades"""
+"""GET /api/eval/summary  ·  GET /api/eval/history  ·  POST /api/eval/outcome/{condition_id}  ·  POST /api/eval/grade/{run_id}  ·  GET /api/eval/grades"""
 
 from __future__ import annotations
 
@@ -161,6 +161,77 @@ async def grade_memo(run_id: str) -> EvalGradeOut:
 
     data = await run_in_threadpool(_save)
     return EvalGradeOut(**data)
+
+
+class OutcomeIn(BaseModel):
+    outcome: float  # 1.0 = YES resolved, 0.0 = NO resolved
+
+
+class OutcomeOut(BaseModel):
+    condition_id: str
+    run_id: str
+    agent_estimate: float
+    outcome: float
+    brier_score: float
+    updated: int  # number of rows updated
+
+
+@router.post("/outcome/{condition_id}", response_model=OutcomeOut)
+async def record_outcome(condition_id: str, body: OutcomeIn) -> OutcomeOut:
+    """Record the actual market outcome (1.0=YES, 0.0=NO) for a condition_id.
+
+    Updates ALL unresolved prediction_history rows for this condition and
+    computes Brier score = (agent_estimate - outcome)² for each.
+    Returns stats for the most-recent updated row.
+    """
+    from src.storage.db import get_engine
+    from src.storage.models import PredictionHistoryORM
+    from sqlalchemy.orm import Session
+    from datetime import datetime, timezone
+
+    if body.outcome not in (0.0, 1.0):
+        raise HTTPException(status_code=422, detail="outcome must be 0.0 (NO) or 1.0 (YES)")
+
+    engine = get_engine()
+
+    def _update():
+        with Session(engine) as s:
+            rows = (
+                s.query(PredictionHistoryORM)
+                .filter(
+                    PredictionHistoryORM.condition_id == condition_id,
+                    PredictionHistoryORM.resolved == False,  # noqa: E712
+                )
+                .all()
+            )
+            if not rows:
+                return None, 0
+
+            now = datetime.now(timezone.utc)
+            for row in rows:
+                row.outcome = bool(body.outcome)
+                row.brier_score = round((row.agent_estimate - body.outcome) ** 2, 6)
+                row.resolved = True
+                row.resolved_at = now
+
+            s.commit()
+            s.refresh(rows[-1])
+            latest = rows[-1]
+            return {
+                "condition_id": latest.condition_id,
+                "run_id": latest.run_id,
+                "agent_estimate": latest.agent_estimate,
+                "outcome": float(latest.outcome),
+                "brier_score": latest.brier_score,
+            }, len(rows)
+
+    data, count = await run_in_threadpool(_update)
+    if data is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No unresolved predictions found for condition_id={condition_id!r}",
+        )
+    return OutcomeOut(**data, updated=count)
 
 
 @router.get("/grades", response_model=list[EvalGradeOut])
