@@ -1,4 +1,4 @@
-"""LangGraph StateGraph — 4-node sequential pipeline."""
+"""LangGraph StateGraph — 4-node pipeline with conditional routing."""
 
 from __future__ import annotations
 
@@ -34,6 +34,84 @@ class AgentState(TypedDict):
     error: str | None
 
 
+def _should_write_memo(state: AgentState) -> str:
+    """Conditional routing after risk_critic.
+
+    Aborts early (skips memo_writer) when the market is untradeable:
+      - Critically low liquidity (< $500) AND LOW_LIQUIDITY flag raised
+      - OR market is already at extreme probability (>98% or <2%), likely resolved
+
+    Returns "abort" → END with a NO_TRADE memo stub.
+    Returns "continue" → memo_writer for full analysis.
+    """
+    flags = state.get("risk_flags", [])
+    snapshot = state.get("snapshot") or {}
+    liquidity = snapshot.get("liquidity") or 0
+    yes_price = snapshot.get("yes_price")
+
+    # Critically illiquid — price is unreliable, no point analysing
+    if "LOW_LIQUIDITY" in flags and liquidity < 500:
+        logger.info(
+            "Aborting memo — critically low liquidity $%.0f (run=%s)",
+            liquidity, state.get("run_id"),
+        )
+        return "abort"
+
+    # Market at extreme: already near resolution, edge opportunity is gone
+    if yes_price is not None and (yes_price > 0.98 or yes_price < 0.02):
+        logger.info(
+            "Aborting memo — price at extreme %.3f, market likely resolved (run=%s)",
+            yes_price, state.get("run_id"),
+        )
+        return "abort"
+
+    return "continue"
+
+
+async def _abort_node(state: AgentState) -> dict:
+    """Emit a minimal NO_TRADE memo when the graph aborts early."""
+    from src.run_store import push_log
+
+    run_id = state.get("run_id", "")
+    snapshot = state.get("snapshot") or {}
+    flags = state.get("risk_flags", [])
+
+    reason = (
+        "critically low liquidity" if "LOW_LIQUIDITY" in flags
+        else "market price at extreme (likely resolved)"
+    )
+    await push_log(run_id, f"  ✗ Analysis aborted — {reason}", "warn")
+    await push_log(run_id, "  → Recommendation: NO_TRADE (untradeable market)", "warn")
+
+    yes_price = snapshot.get("yes_price", 0.5) or 0.5
+    memo = {
+        "run_id": run_id,
+        "condition_id": state.get("condition_id", ""),
+        "market_question": snapshot.get("question", ""),
+        "market_probability": yes_price,
+        "agent_estimate": yes_price,
+        "edge": 0.0,
+        "confidence": "uncertain",
+        "yes_case": [],
+        "no_case": [],
+        "resolution_source": snapshot.get("resolution_source") or "not specified",
+        "resolution_deadline": snapshot.get("end_date") or "unknown",
+        "resolution_condition": "Analysis aborted — see abort reason",
+        "resolution_ambiguities": [],
+        "resolution_risk_level": "high",
+        "resolution_risk_notes": f"Aborted: {reason}",
+        "manipulation_risk": "unknown",
+        "manipulation_notes": "",
+        "recommendation": "no_trade",
+        "recommendation_rationale": f"Market aborted early: {reason}. Manual review required.",
+        "key_uncertainties": [f"Abort reason: {reason}"],
+        "model_name": "aborted",
+        "prompt_version": "v1",
+        "sources_found": 0,
+    }
+    return {"memo": memo}
+
+
 def _build_graph() -> Any:
     workflow = StateGraph(AgentState)
 
@@ -41,12 +119,21 @@ def _build_graph() -> Any:
     workflow.add_node("evidence_retriever", evidence_retriever_node)
     workflow.add_node("risk_critic", risk_critic_node)
     workflow.add_node("memo_writer", memo_writer_node)
+    workflow.add_node("abort", _abort_node)
 
     workflow.set_entry_point("market_analyzer")
     workflow.add_edge("market_analyzer", "evidence_retriever")
     workflow.add_edge("evidence_retriever", "risk_critic")
-    workflow.add_edge("risk_critic", "memo_writer")
+
+    # Conditional routing: untradeable markets abort before memo_writer
+    workflow.add_conditional_edges(
+        "risk_critic",
+        _should_write_memo,
+        {"continue": "memo_writer", "abort": "abort"},
+    )
+
     workflow.add_edge("memo_writer", END)
+    workflow.add_edge("abort", END)
 
     return workflow.compile()
 
