@@ -270,7 +270,12 @@ async def grade_memo(
 
     # ── LLM call ──────────────────────────────────────────────────────────────
     try:
-        raw = await _call_judge_llm(prompt, model_to_use, key, provider)
+        try:
+            raw = await _call_judge_llm(prompt, model_to_use, key, provider)
+        except TypeError as exc:
+            if "positional" not in str(exc):
+                raise
+            raw = await _call_judge_llm(prompt, model_to_use, key)
     except Exception as exc:
         logger.warning("Judge LLM call failed: %s — using fallback scores", exc)
         raw = {

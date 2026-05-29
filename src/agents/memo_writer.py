@@ -471,19 +471,9 @@ async def memo_writer_node(state: dict) -> dict:
             sources_found=len(search_results),
         )
     else:
-        yes_case = memo_raw.get("yes_case", [])
-        no_case = memo_raw.get("no_case", [])
-        
-        # Enrich with URLs from retrieved sources
-        all_sources = search_results + (sources or [])
-        for ev in yes_case + no_case:
-            src = ev.get("source", "")
-            for s in all_sources:
-                domain = s.get("domain", "")
-                url = s.get("url", "")
-                if src and domain and (src.lower() == domain.lower() or src.lower() in url.lower() or domain.lower() in src.lower()):
-                    ev["url"] = url
-                    break
+        source_candidates = _real_source_candidates(sources, search_results)
+        yes_case = _enrich_case_items(memo_raw.get("yes_case", []), "yes", source_candidates)
+        no_case = _enrich_case_items(memo_raw.get("no_case", []), "no", source_candidates)
 
         edge = round(memo_raw.get("agent_estimate", yes_price) - yes_price, 4)
         memo = {

@@ -15,6 +15,7 @@ from src.agents.evidence_retriever import (
     _generate_queries,
     _quote_valid,
     _extract_and_validate,
+    _source_id_for,
 )
 from src.schemas import CitedEvidence
 
@@ -109,6 +110,7 @@ def test_quote_valid_whitespace_normalisation():
 
 def _make_ev(url: str, confidence: str, label: str = "yes_case") -> CitedEvidence:
     return CitedEvidence(
+        source_id=_source_id_for(url),
         claim=f"Some claim from {url}",
         quote="verbatim quote here",
         source_url=url,
@@ -168,7 +170,7 @@ def test_dedup_by_url_single_items():
 
 @pytest.mark.asyncio
 async def test_extract_and_validate_rejects_bad_quote(monkeypatch):
-    """When the LLM returns a hallucinated quote, _extract_and_validate returns None."""
+    """Unsupported LLM quotes are downgraded to snippet-supported evidence."""
     from src.retrieval.search import SearchHit
 
     hit = SearchHit(
@@ -197,7 +199,10 @@ async def test_extract_and_validate_rejects_bad_quote(monkeypatch):
     monkeypatch.setattr(mod, "_call_extraction_llm", fake_llm)
 
     result = await _extract_and_validate(hit, "Will Fed cut rates?", "model", "key")
-    assert result is None, "Hallucinated quote must be rejected → None"
+    assert result is not None
+    assert result.support_level == "snippet_supported"
+    assert result.confidence == "low"
+    assert result.source_id == _source_id_for(hit.url)
 
 
 @pytest.mark.asyncio
@@ -236,3 +241,5 @@ async def test_extract_and_validate_accepts_valid_quote(monkeypatch):
     assert result.confidence == "high"
     assert result.label == "no_case"
     assert result.publisher == "reuters.com"
+    assert result.source_id == _source_id_for(hit.url)
+    assert result.support_level == "primary_source_verified"

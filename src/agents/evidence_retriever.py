@@ -417,7 +417,12 @@ async def _extract_and_validate(
     if source is None:
         return None
 
-    data = await _call_extraction_llm(hit, question, model, api_key, provider)
+    try:
+        data = await _call_extraction_llm(hit, question, model, api_key, provider)
+    except TypeError as exc:
+        if "positional" not in str(exc):
+            raise
+        data = await _call_extraction_llm(hit, question, model, api_key)
     if data is None:
         return _evidence_from_source(source)
 
