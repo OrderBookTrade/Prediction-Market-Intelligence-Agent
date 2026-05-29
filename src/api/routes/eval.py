@@ -24,6 +24,7 @@ class EvalSummaryOut(BaseModel):
 
 class PredictionRecordOut(BaseModel):
     id: int
+    condition_id: str
     market: str
     agent: float
     market_price: float
@@ -66,6 +67,7 @@ async def prediction_history(limit: int = 50) -> list[PredictionRecordOut]:
     return [
         PredictionRecordOut(
             id=row.id,
+            condition_id=row.condition_id,
             market=row.market_question,
             agent=row.agent_estimate,
             market_price=row.market_probability,
